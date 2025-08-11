@@ -1,3 +1,4 @@
+// Kunci-kunci state yang digunakan Popup (sinkron dengan Background/Content)
 const STATE_KEYS = {
 	PRIORITY: "priority",
 	RUNMODE: "runMode",
@@ -6,8 +7,12 @@ const STATE_KEYS = {
 	CLASSES: "classes",
 	COLLAPSE: "collapseSections",
 	LAST_CAPTCHA: "lastCaptcha",
+
+	NOTIFY_ENABLED: "notifyExtendedEnabled",
+	NOTIFY_LAST_TS: "notifyExtendedLastCheckTs",
 };
 
+// Label kategori untuk tampilan UI
 const LABELS = {
 	jur: "Kelas Dep.",
 	jurlain: "Kelas Dep. Lain",
@@ -16,6 +21,7 @@ const LABELS = {
 	mbkm: "Kelas MBKM",
 };
 
+// Referensi elemen UI utama
 const els = {
 	statusDot: document.getElementById("statusDot"),
 	setupSection: document.getElementById("setupSection"),
@@ -39,6 +45,11 @@ const els = {
 	captchaSubmit: document.getElementById("captchaSubmit"),
 	captchaRefresh: document.getElementById("captchaRefresh"),
 	log: document.getElementById("log"),
+
+	// Elemen untuk Notify Extended
+	notifyToggle: document.getElementById("notifyToggle"),
+	notifyBadge: document.getElementById("notifyBadge"),
+	notifyHint: document.getElementById("notifyHint"),
 };
 
 let classesCache = [];
@@ -52,21 +63,26 @@ let collapseState = {
 };
 let dragging = null;
 
+// Inisialisasi Popup
 init().catch(console.error);
 
 async function init() {
+	// Muat state awal, setup UI mode, dan pasang event handler
 	const st = await getState();
 	window.__stateCache = st;
 
 	classesCache = st[STATE_KEYS.CLASSES]?.items || [];
-	collapseState = Object.assign(collapseState, st[STATE_KEYS.COLLAPSE] || {});
+	collapseState = Object.assign(collapseState, st["collapseSections"] || {});
 
-	if (st[STATE_KEYS.RUNMODE] === "hunting") {
-		enterHuntUI();
-	} else {
-		enterSetupUI();
-	}
+	// Status awal toggle Notify Extended
+	const notifyEnabled = !!st[STATE_KEYS.NOTIFY_ENABLED];
+	els.notifyToggle.checked = notifyEnabled;
 
+	// Mode UI awal (Idle vs Hunting)
+	if (st[STATE_KEYS.RUNMODE] === "hunting") enterHuntUI();
+	else enterSetupUI();
+
+	// Event handler
 	els.search.addEventListener("input", () => {
 		filterText = els.search.value.trim();
 		renderClassSections(getPrioritySync());
@@ -83,7 +99,9 @@ async function init() {
 	});
 	els.captchaRefresh.addEventListener("click", refreshCaptcha);
 
-	// Update UI jika LAST_CAPTCHA berubah (mis. user klik Refresh)
+	els.notifyToggle.addEventListener("change", onToggleNotify);
+
+	// Dengarkan perubahan storage untuk captcha, runMode, dan notify
 	chrome.storage.onChanged.addListener(async (changes, area) => {
 		if (area !== "local") return;
 
@@ -94,24 +112,30 @@ async function init() {
 			const meta = lc.meta || null;
 
 			if (els.huntSection.hidden) enterHuntUI();
-
-			// Utamakan dataURL untuk mencegah network request
 			const nextSrc = dataUrl || imageUrl || "";
-			// Hanya set kalau berbeda, supaya tidak decode ulang
 			if (nextSrc && els.captchaPreview.src !== nextSrc) {
 				els.captchaPreview.src = nextSrc;
 			}
-
 			renderTargetMeta(meta);
 			setTimeout(() => els.captchaInput?.focus(), 30);
 		}
 
-		if (changes[STATE_KEYS.RUNMODE]?.newValue === "idle") {
-			enterSetupUI();
+		if (changes[STATE_KEYS.RUNMODE]?.newValue) {
+			if (changes[STATE_KEYS.RUNMODE].newValue === "idle") {
+				enterSetupUI();
+			} else if (changes[STATE_KEYS.RUNMODE].newValue === "hunting") {
+				enterHuntUI();
+			}
+		}
+
+		if (changes[STATE_KEYS.NOTIFY_ENABLED]) {
+			const on = !!changes[STATE_KEYS.NOTIFY_ENABLED].newValue;
+			els.notifyToggle.checked = on;
+			updateNotifyUI(on);
 		}
 	});
 
-	// Render gambar & meta terakhir TANPA fetch server
+	// Jika sedang hunting, tampilkan CAPTCHA/meta terakhir
 	const lc = st[STATE_KEYS.LAST_CAPTCHA];
 	if (lc && st[STATE_KEYS.RUNMODE] === "hunting") {
 		const nextSrc = lc.imageDataUrl || lc.imageUrl || "";
@@ -119,18 +143,51 @@ async function init() {
 			els.captchaPreview.src = nextSrc;
 		}
 		renderTargetMeta(lc.meta || null);
-
 		const pending = st[STATE_KEYS.PENDING];
-		if (pending?.attempt) {
+		if (pending?.attempt)
 			els.attemptInfo.textContent = `Percobaan ke-${pending.attempt}`;
-		}
 		setTimeout(() => els.captchaInput?.focus(), 50);
 	}
 
+	updateNotifyUI(notifyEnabled);
 	setupDragAndDrop();
 }
 
-/* ---------- UI modes ---------- */
+/* ---------- Notify Extended (UI) ---------- */
+
+async function onToggleNotify() {
+	const on = els.notifyToggle.checked;
+	const st = await getState();
+	if (st[STATE_KEYS.RUNMODE] !== "idle" && on) {
+		// Tidak bisa mengaktifkan saat tidak Idle
+		els.notifyToggle.checked = false;
+		return;
+	}
+	await chrome.runtime.sendMessage({
+		type: "TOGGLE_NOTIFY_EXTENDED",
+		enable: on,
+	});
+	if (on) {
+		// Bangun baseline terbaru
+		await chrome.runtime.sendMessage({ type: "NOTIFY_BUILD_BASELINE" });
+	}
+	updateNotifyUI(on);
+}
+
+function updateNotifyUI(on) {
+	els.notifyBadge.textContent = on ? "On" : "Off";
+	els.notifyBadge.className = `badge ${on ? "live" : "muted"}`;
+	// Saat Notify ON → disable Start agar tidak bentrok (kebijakan)
+	els.startBtn.disabled = on;
+	els.startBtn.title = on
+		? "Matikan Notify Extended untuk memulai Hunting"
+		: "";
+	els.notifyHint.textContent = on
+		? "Watching… halaman akan direfresh berkala sesuai Options."
+		: "Memantau kenaikan kuota untuk kelas di Prioritas. Hanya bisa diaktifkan saat Idle.";
+}
+
+/* ---------- Mode UI ---------- */
 function enterHuntUI() {
 	setDot("hunting");
 	els.setupSection.hidden = true;
@@ -147,6 +204,8 @@ function setDot(kind) {
 	els.statusDot.className = `dot ${kind}`;
 	els.statusDot.title = kind === "hunting" ? "Hunting" : "Idle";
 }
+
+/* ---------- Umum ---------- */
 
 async function getState() {
 	return await chrome.runtime.sendMessage({ type: "GET_STATE" });
@@ -198,7 +257,7 @@ function renderClassSections(priority) {
     `;
 		hdr.addEventListener("click", async () => {
 			collapseState[k] = !collapseState[k];
-			await chrome.storage.local.set({ [STATE_KEYS.COLLAPSE]: collapseState });
+			await chrome.storage.local.set({ collapseSections: collapseState });
 			renderClassSections(getPrioritySync());
 		});
 		section.appendChild(hdr);
@@ -210,10 +269,10 @@ function renderClassSections(priority) {
 
 		for (const c of items) ul.appendChild(classItem(c, false));
 		section.appendChild(ul);
-
 		els.classSections.appendChild(section);
 	}
 
+	// Kolom Prioritas
 	els.priorityList.innerHTML = "";
 	for (const p of priority) els.priorityList.appendChild(classItem(p, true));
 
@@ -221,7 +280,6 @@ function renderClassSections(priority) {
 	bindClassSectionDropzones();
 }
 
-// Item builder
 function classItem(item, removable) {
 	const li = document.createElement("li");
 	li.draggable = true;
@@ -341,7 +399,6 @@ function renderTargetMeta(meta) {
 }
 
 /* ---------- Drag & Drop ---------- */
-// (tidak berubah; dipertahankan dari versi sebelumnya)
 function setupDragAndDrop() {
 	document.addEventListener("dragstart", (e) => {
 		const li = e.target.closest("li");
@@ -361,10 +418,9 @@ function setupDragAndDrop() {
 		dragging = null;
 		clearDropIndicators();
 	});
-	els.classSections.addEventListener("dragover", (e) => {
-		e.preventDefault();
-	});
+	els.classSections.addEventListener("dragover", (e) => e.preventDefault());
 }
+
 function bindPriorityDropzone() {
 	const priorityCol = els.priorityList.closest(".col") || els.priorityList;
 	const onOver = (e) => {
@@ -382,8 +438,10 @@ function bindPriorityDropzone() {
 		priorityCol.classList.remove("priority-drop");
 		const raw = e.dataTransfer.getData("text/plain") || dragging?.raw;
 		if (!raw) return;
+
 		const pr = getPrioritySync().slice();
 		const index = getDropIndex(els.priorityList, e.clientY);
+
 		if (dragging?.source === "priority") {
 			const srcIndex = pr.findIndex((p) => p.rawValue === raw);
 			if (srcIndex < 0) return;
@@ -402,10 +460,12 @@ function bindPriorityDropzone() {
 		}
 		clearDropIndicators();
 	};
+
 	priorityCol.addEventListener("dragover", onOver);
 	priorityCol.addEventListener("dragleave", onLeave);
 	priorityCol.addEventListener("drop", onDrop);
 }
+
 function bindClassSectionDropzones() {
 	els.classSections.querySelectorAll(".list").forEach((ul) => {
 		ul.classList.remove("drop-target");
@@ -413,9 +473,7 @@ function bindClassSectionDropzones() {
 			e.preventDefault();
 			ul.classList.add("drop-target");
 		});
-		ul.addEventListener("dragleave", () => {
-			ul.classList.remove("drop-target");
-		});
+		ul.addEventListener("dragleave", () => ul.classList.remove("drop-target"));
 		ul.addEventListener("drop", async (e) => {
 			e.preventDefault();
 			ul.classList.remove("drop-target");
@@ -434,6 +492,7 @@ function bindClassSectionDropzones() {
 		});
 	});
 }
+
 function getDropIndex(ul, y) {
 	const children = Array.from(ul.children);
 	if (!children.length) return 0;
@@ -464,7 +523,7 @@ function clearDropIndicators() {
 		.forEach((el) => el.classList.remove("drop-before"));
 }
 
-/* ---------- Utils ---------- */
+/* ---------- Utilitas ---------- */
 function groupBy(arr, key) {
 	return arr.reduce((acc, it) => {
 		const k = it[key] || "";

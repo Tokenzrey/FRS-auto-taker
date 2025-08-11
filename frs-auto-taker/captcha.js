@@ -3,9 +3,11 @@ const val = document.getElementById("captchaVal");
 const refreshBtn = document.getElementById("refreshBtn");
 const submitBtn = document.getElementById("submitBtn");
 
+// Dialog CAPTCHA: menampilkan gambar, input, dan aksi refresh/submit
 init().catch(console.error);
 
 async function init() {
+	// Ambil URL captcha terakhir dari storage dan pasang event handler
 	const lc = await chrome.storage.local.get(["lastCaptcha"]);
 	const imageUrl = lc.lastCaptcha?.imageUrl;
 	img.src = imageUrl || "";
@@ -17,7 +19,7 @@ async function init() {
 	});
 	refreshBtn.addEventListener("click", refreshImg);
 
-	// Listen storage change for new image (if page refreshes it)
+	// Sinkronisasi jika gambar CAPTCHA diperbarui dari content script
 	chrome.storage.onChanged.addListener((changes, area) => {
 		if (area !== "local") return;
 		if (changes.lastCaptcha?.newValue?.imageUrl) {
@@ -36,11 +38,11 @@ async function submit() {
 }
 
 async function refreshImg() {
-	// Tambahkan noise param agar reload gambar
+	// Tambahkan parameter acak agar gambar tidak di-cache
 	const url = new URL(img.src);
 	url.searchParams.set("_", String(Math.random()).slice(2));
 	img.src = url.href;
-	// Update juga di storage agar popup sinkron (opsional)
+	// Perbarui storage agar komponen lain ikut tersinkron
 	const lc = await chrome.storage.local.get(["lastCaptcha"]);
 	await chrome.storage.local.set({
 		lastCaptcha: { ...(lc.lastCaptcha || {}), imageUrl: img.src },

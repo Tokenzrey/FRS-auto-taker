@@ -7,14 +7,28 @@
 	</head>
 	<body>
 		<h1>Options</h1>
+
 		<section>
-			<label
-				>Max CAPTCHA Attempts:
+			<label>
+				Max CAPTCHA Attempts:
 				<input id="maxCaptcha" type="number" min="1" max="20" />
 			</label>
 		</section>
+
+		<section>
+			<label>
+				Time reload notify extended (detik):
+				<input id="notifyIntervalSec" type="number" min="5" max="300" />
+			</label>
+			<div class="help">
+				Interval reload halaman saat Notify Extended aktif. Disarankan 15–60
+				detik.
+			</div>
+		</section>
+
 		<button id="save">Save</button>
 		<div id="msg"></div>
+
 		<script src="options.js"></script>
 	</body>
 </html>

@@ -1,4 +1,12 @@
-/* Agent di halaman list_frs.php */
+/*
+ * Agent untuk halaman list_frs.php
+ *
+ * Fungsionalitas:
+ * - Parsing kelas (sedini mungkin) dan penyimpanan ke storage
+ * - Proses ambil kelas (Hunting) + evaluasi hasil setelah reload
+ * - Pusat CAPTCHA (snapshot dataURL, refresh, submit)
+ * - Notify Extended (pantau kenaikan kuota, tampilkan overlay+suara, auto mulai hunting)
+ */
 
 const SELECTORS = {
 	jur: "#kelasjur",
@@ -8,6 +16,7 @@ const SELECTORS = {
 	pengayaan: "#kelaspengayaan",
 	mbkm: "#kelasmbkm",
 };
+
 const FORM = {
 	sip: () => document.querySelector("#sipform"),
 	act: () => document.querySelector("#act"),
@@ -23,24 +32,119 @@ const STATE_KEYS = {
 	PENDING: "pendingAction",
 	ACTIVE_INDEX: "activeCandidateIndex",
 	CLASSES: "classes",
+	LAST_CAPTCHA: "lastCaptcha",
+
+	// Notify Extended
+	NOTIFY_ENABLED: "notifyExtendedEnabled",
+	NOTIFY_BASELINE: "notifyExtendedBaseline", // { [rawValue]: { kuota, ts } }
+	NOTIFY_LAST_TS: "notifyExtendedLastCheckTs",
 };
+
+// Early DOM Sniffer: mem-parsing kelas segera saat opsi muncul
+// Tujuan: mengurangi jeda, tidak menunggu render/DOMContentLoaded
+earlyParseWhenOptionsReady();
+
+function earlyParseWhenOptionsReady() {
+	// gabungan semua selector yang mungkin berisi kelas
+	const ALL_SELECTORS = [
+		SELECTORS.jur,
+		SELECTORS.jurlain,
+		SELECTORS.tpb,
+		SELECTORS.pengayaan,
+		SELECTORS.mbkm,
+	]
+		.filter(Boolean)
+		.join(",");
+
+	let parsedOnce = false;
+	let mo = null;
+
+	const tryParse = () => {
+		if (parsedOnce) return;
+
+		const selects = Array.from(document.querySelectorAll(ALL_SELECTORS));
+		if (!selects.length) return;
+
+		// cek apakah SUDAH ada opsi bermakna (value bukan string kosong)
+		const hasUsefulOptions = selects.some((sel) =>
+			Array.from(sel.options || []).some(
+				(opt) => (opt.value || "").trim() !== ""
+			)
+		);
+		if (!hasUsefulOptions) return;
+
+		// saat opsi sudah ada → parse segera
+		const classes = parseAllClasses();
+		chrome.storage.local.set({
+			[STATE_KEYS.CLASSES]: { updatedAt: Date.now(), items: classes },
+		});
+
+		parsedOnce = true;
+		if (mo) mo.disconnect();
+	};
+
+	// 1) Coba sinkron (jika sudah ada)
+	tryParse();
+
+	// 2) Jika belum ada, observasi DOM untuk menangkap momen pertama opsi muncul
+	if (!parsedOnce) {
+		mo = new MutationObserver(() => {
+			tryParse();
+		});
+		mo.observe(document.documentElement || document, {
+			childList: true,
+			subtree: true,
+		});
+
+		// 3) Fallback: coba ulang beberapa kali awal (ringan, non-spam)
+		let retries = 10;
+		const tick = () => {
+			if (parsedOnce) return;
+			tryParse();
+			if (!parsedOnce && --retries > 0) {
+				// gunakan micro-delay kecil supaya responsif
+				setTimeout(tick, 50);
+			}
+		};
+		setTimeout(tick, 0);
+	}
+}
 
 let MAX_CAPTCHA_ATTEMPTS = 8;
 const BACKOFF_MS = 3000;
 
+// Notify Extended runtime
+let notifyTimer = null;
+let notifyIntervalMs = 30000; // default; bisa ditimpa dari Options
+const OVERLAY_ID = "frs-ext-notify-overlay";
+
 init().catch(console.error);
 
 async function init() {
+	// Muat opsi dari Options
 	try {
 		const { opts } = await chrome.storage.local.get(["opts"]);
 		if (opts?.maxCaptcha) MAX_CAPTCHA_ATTEMPTS = opts.maxCaptcha;
+		if (opts?.notifyIntervalSec)
+			notifyIntervalMs = Math.max(5, +opts.notifyIntervalSec) * 1000;
 	} catch {}
 
+	// Parse kelas saat halaman siap
 	const classes = parseAllClasses();
 	await chrome.storage.local.set({
 		[STATE_KEYS.CLASSES]: { updatedAt: Date.now(), items: classes },
 	});
 
+	// Notify Extended: jalankan siklus awal saat load (jika aktif)
+	const { notifyExtendedEnabled } = await chrome.storage.local.get([
+		STATE_KEYS.NOTIFY_ENABLED,
+	]);
+	if (notifyExtendedEnabled) {
+		// 1) bandingkan baseline (jika ada), 2) jika tidak extended, jadwalkan reload berikutnya
+		await notifyCheckAndSchedule();
+	}
+
+	// Jika sedang hunting: evaluasi pending lalu lanjut
 	const { priority, runMode } = await chrome.storage.local.get([
 		STATE_KEYS.PRIORITY,
 		STATE_KEYS.RUNMODE,
@@ -56,6 +160,7 @@ async function init() {
 	}
 }
 
+// Listener pesan dari Background/Popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 	(async () => {
 		switch (msg?.type) {
@@ -71,6 +176,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 			case "PRIORITY_UPDATED":
 				await chrome.storage.local.set({ [STATE_KEYS.ACTIVE_INDEX]: 0 });
+				// Jika notify extended ON → rebuild baseline agar akurat
+				{
+					const { notifyExtendedEnabled } = await chrome.storage.local.get([
+						STATE_KEYS.NOTIFY_ENABLED,
+					]);
+					if (notifyExtendedEnabled) await buildNotifyBaseline();
+				}
 				await huntNext(true);
 				sendResponse({ ok: true });
 				break;
@@ -80,21 +192,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 				sendResponse({ ok: true });
 				break;
 
-			// tombol Refresh di popup
 			case "REFRESH_CAPTCHA":
 				await refreshCaptchaImage();
 				sendResponse({ ok: true });
 				break;
 
-			default:
+			// Notify Extended controls
+			case "NOTIFY_EXTENDED_START":
+				await enableNotifyWatcher(true);
 				sendResponse({ ok: true });
 				break;
+
+			case "NOTIFY_EXTENDED_STOP":
+				await enableNotifyWatcher(false);
+				sendResponse({ ok: true });
+				break;
+
+			case "NOTIFY_BUILD_BASELINE":
+				await buildNotifyBaseline();
+				sendResponse({ ok: true });
+				break;
+
+			default:
+				sendResponse({ ok: true });
 		}
 	})();
 	return true;
 });
 
-// ---------- Core ----------
+/* ===========================
+	Hunting (inti)
+=========================== */
 
 async function huntNext(forceTop = false) {
 	const st = await chrome.storage.local.get([
@@ -135,13 +263,11 @@ async function tryTakeCandidate(candidate, index) {
 		[STATE_KEYS.ACTIVE_INDEX]: index,
 	});
 
-	// Ambil src CAPTCHA yang ADA saat ini TANPA cache-bust
+	// CAPTCHA: gunakan snapshot dataURL agar popup tidak memicu request ulang
 	const imgEl = FORM.captchaImage();
 	const imgUrl = imgEl
 		? new URL(imgEl.getAttribute("src"), location.href).href
 		: new URL("/securimage/securimage_show.php", location.href).href;
-
-	// Buat snapshot dataURL agar popup tidak memicu request server
 	const imageDataUrl = await snapshotCaptcha(imgEl, imgUrl);
 
 	const meta = {
@@ -156,8 +282,8 @@ async function tryTakeCandidate(candidate, index) {
 
 	await chrome.runtime.sendMessage({
 		type: "NEED_CAPTCHA",
-		imageUrl: imgUrl, // tetap dikirim sebagai fallback
-		imageDataUrl, // <-- utama untuk popup
+		imageUrl: imgUrl,
+		imageDataUrl,
 		meta,
 	});
 
@@ -237,7 +363,273 @@ async function evaluateAfterReload(pending) {
 	}
 }
 
-// ---------- Helpers ----------
+/* ===========================
+	Notify Extended
+=========================== */
+
+async function enableNotifyWatcher(enable) {
+	// Baca opsi interval dari storage
+	try {
+		const { opts } = await chrome.storage.local.get(["opts"]);
+		if (opts?.notifyIntervalSec)
+			notifyIntervalMs = Math.max(5, +opts.notifyIntervalSec) * 1000;
+	} catch {}
+
+	// Simpan flag enable/disable ke storage
+	await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_ENABLED]: !!enable });
+
+	// Bersihkan timer yang aktif jika ada
+	if (notifyTimer) {
+		clearTimeout(notifyTimer);
+		notifyTimer = null;
+	}
+
+	if (enable) {
+		await buildNotifyBaseline(); // Snapshot awal dari daftar prioritas
+		await notifyCheckAndSchedule(); // Cek sekarang, lalu jadwalkan reload
+	} else {
+		removeOverlay();
+	}
+}
+
+// Membangun baseline kuota dari kelas di daftar prioritas saat ini
+async function buildNotifyBaseline() {
+	const st = await chrome.storage.local.get([
+		STATE_KEYS.PRIORITY,
+		STATE_KEYS.CLASSES,
+	]);
+	const priority = st[STATE_KEYS.PRIORITY] || [];
+	const classes = st[STATE_KEYS.CLASSES]?.items || parseAllClasses();
+
+	const pMap = new Map(priority.map((p) => [p.rawValue, true]));
+	const baseline = {};
+
+	for (const c of classes) {
+		if (!pMap.has(c.rawValue)) continue;
+		const kuota = c.kapasitas?.kuota;
+		if (typeof kuota === "number") {
+			baseline[c.rawValue] = { kuota, ts: Date.now() };
+		}
+	}
+
+	await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_BASELINE]: baseline });
+}
+
+// Siklus Notify: bandingkan baseline vs kondisi sekarang.
+// Jika ada kenaikan kuota → overlay + suara + mulai hunting.
+// Jika tidak ada → perbarui baseline dan jadwalkan reload berikutnya.
+async function notifyCheckAndSchedule() {
+	const st = await chrome.storage.local.get([
+		STATE_KEYS.NOTIFY_ENABLED,
+		STATE_KEYS.PRIORITY,
+		STATE_KEYS.CLASSES,
+		STATE_KEYS.NOTIFY_BASELINE,
+		STATE_KEYS.RUNMODE,
+	]);
+
+	// Jika notify tidak aktif atau sedang hunting, hentikan proses
+	if (!st[STATE_KEYS.NOTIFY_ENABLED] || st[STATE_KEYS.RUNMODE] !== "idle")
+		return;
+
+	const priority = st[STATE_KEYS.PRIORITY] || [];
+	const pOrder = new Map(priority.map((p, i) => [p.rawValue, i])); // untuk pilih top-priority
+
+	// Pastikan data kelas terbaru tersedia
+	let classes = st[STATE_KEYS.CLASSES]?.items;
+	if (!Array.isArray(classes) || !classes.length) {
+		classes = parseAllClasses();
+		await chrome.storage.local.set({
+			[STATE_KEYS.CLASSES]: { updatedAt: Date.now(), items: classes },
+		});
+	}
+
+	const baseline = st[STATE_KEYS.NOTIFY_BASELINE] || {};
+	if (!Object.keys(baseline).length) {
+		await buildNotifyBaseline();
+	}
+
+	// Bandingkan kuota baseline vs sekarang
+	const nowMap = new Map(classes.map((c) => [c.rawValue, c]));
+	const extendedItems = [];
+
+	for (const [raw, base] of Object.entries(baseline)) {
+		const c = nowMap.get(raw);
+		if (!c) continue;
+		const newKuota = c.kapasitas?.kuota;
+		const oldKuota = base?.kuota;
+		if (typeof newKuota !== "number" || typeof oldKuota !== "number") continue;
+		if (newKuota > oldKuota) {
+			extendedItems.push({
+				rawValue: raw,
+				displayCode: c.displayCode || c.valueCode,
+				name: c.name || "",
+				kelas: c.kelas || "",
+				oldKuota,
+				newKuota,
+				delta: newKuota - oldKuota,
+				kategori: c.kategori,
+			});
+		}
+	}
+
+	if (extendedItems.length) {
+		// Tampilkan overlay + mainkan suara peringatan
+		showOverlayExtended(extendedItems);
+		playLoudBeep();
+
+		// Pilih target hunting berdasarkan urutan prioritas
+		extendedItems.sort(
+			(a, b) =>
+				(pOrder.get(a.rawValue) ?? 1e9) - (pOrder.get(b.rawValue) ?? 1e9)
+		);
+		const target = extendedItems[0];
+		const targetIndex = pOrder.get(target.rawValue) ?? 0;
+
+		// Matikan notify, set state hunting, dan mulai kandidat target
+		await chrome.runtime.sendMessage({ type: "NOTIFY_EXTENDED_FOUND" });
+		await chrome.storage.local.set({
+			[STATE_KEYS.NOTIFY_ENABLED]: false,
+			[STATE_KEYS.RUNMODE]: "hunting",
+			[STATE_KEYS.PENDING]: null,
+			[STATE_KEYS.ACTIVE_INDEX]: targetIndex,
+		});
+		await chrome.runtime.sendMessage({ type: "NOTIFY_SET_LAST_TS" });
+
+		// Mulai proses ambil kelas (langsung)
+		const st2 = await chrome.storage.local.get([STATE_KEYS.PRIORITY]);
+		const candidate = (st2[STATE_KEYS.PRIORITY] || [])[targetIndex];
+		if (candidate) {
+			await tryTakeCandidate(candidate, targetIndex);
+		}
+		// Overlay akan hilang sendiri 10 detik atau saat submit
+		return;
+	}
+
+	// Tidak ada kenaikan kuota → perbarui baseline agar deteksi delta berkelanjutan
+	const newBaseline = {};
+	for (const p of priority) {
+		const c = nowMap.get(p.rawValue);
+		const kuota = c?.kapasitas?.kuota;
+		if (typeof kuota === "number")
+			newBaseline[p.rawValue] = { kuota, ts: Date.now() };
+	}
+	await chrome.storage.local.set({
+		[STATE_KEYS.NOTIFY_BASELINE]: newBaseline,
+		[STATE_KEYS.NOTIFY_LAST_TS]: Date.now(),
+	});
+
+	// Jadwalkan reload berikutnya (menghormati interval dari Options)
+	if (notifyTimer) clearTimeout(notifyTimer);
+	notifyTimer = setTimeout(() => {
+		// reload page untuk mendapatkan data terbaru
+		location.reload();
+	}, notifyIntervalMs);
+}
+
+// Overlay merah berisi daftar kelas yang kuotanya bertambah (otomatis hilang 10 detik)
+function showOverlayExtended(items) {
+	removeOverlay();
+	const overlay = document.createElement("div");
+	overlay.id = OVERLAY_ID;
+	overlay.style.position = "fixed";
+	overlay.style.inset = "0";
+	overlay.style.background = "rgba(255,0,0,0.25)";
+	overlay.style.zIndex = "2147483647";
+	overlay.style.display = "grid";
+	overlay.style.placeItems = "center";
+
+	const card = document.createElement("div");
+	card.style.background = "rgba(255,255,255,0.98)";
+	card.style.borderRadius = "12px";
+	card.style.boxShadow = "0 12px 30px rgba(0,0,0,0.25)";
+	card.style.maxWidth = "720px";
+	card.style.width = "90%";
+	card.style.padding = "16px 18px";
+	card.style.fontFamily = "system-ui, Arial, sans-serif";
+
+	const title = document.createElement("div");
+	title.textContent = "Kapasitas Kelas Bertambah";
+	title.style.fontWeight = "700";
+	title.style.fontSize = "20px";
+	title.style.marginBottom = "10px";
+
+	const list = document.createElement("div");
+	list.style.maxHeight = "320px";
+	list.style.overflow = "auto";
+	list.style.fontSize = "14px";
+	list.style.color = "#111";
+
+	for (const it of items) {
+		const row = document.createElement("div");
+		row.style.padding = "8px 10px";
+		row.style.border = "1px solid #eee";
+		row.style.borderRadius = "8px";
+		row.style.background = "#fff";
+		row.style.marginBottom = "8px";
+		row.innerHTML = `
+      <div style="font-weight:600">${escapeHtml(it.displayCode)} — ${escapeHtml(
+			it.name
+		)}</div>
+      <div style="color:#444">Kelas ${escapeHtml(String(it.kelas))}</div>
+      <div style="margin-top:4px">Kuota: <b>${it.oldKuota}</b> → <b>${
+			it.newKuota
+		}</b> (+${it.delta})</div>
+    `;
+		list.appendChild(row);
+	}
+
+	const hint = document.createElement("div");
+	hint.textContent = "Layar akan kembali normal otomatis dalam 10 detik…";
+	hint.style.fontSize = "12px";
+	hint.style.color = "#666";
+	hint.style.marginTop = "8px";
+
+	card.appendChild(title);
+	card.appendChild(list);
+	card.appendChild(hint);
+	overlay.appendChild(card);
+	document.body.appendChild(overlay);
+
+	// Auto-remove
+	setTimeout(removeOverlay, 10000);
+}
+
+function removeOverlay() {
+	document.getElementById(OVERLAY_ID)?.remove();
+}
+
+// Suara peringatan singkat
+function playLoudBeep() {
+	try {
+		const audio = new Audio(
+			chrome.runtime.getURL("assets/notify-extended.mp3")
+		);
+		audio.play();
+
+		const AudioCtx = window.AudioContext || window.webkitAudioContext;
+		const ctx = new AudioCtx();
+		const osc = ctx.createOscillator();
+		const gain = ctx.createGain();
+		osc.type = "square";
+		osc.frequency.value = 880; // tinggi
+		gain.gain.value = 0.5; // cukup keras
+		osc.connect(gain).connect(ctx.destination);
+		osc.start();
+
+		// pattern: 300ms on, 150ms off, 300ms on
+		setTimeout(() => (gain.gain.value = 0), 300);
+		setTimeout(() => (gain.gain.value = 0.5), 450);
+		setTimeout(() => {
+			gain.gain.value = 0;
+			osc.stop();
+			ctx.close();
+		}, 750);
+	} catch {}
+}
+
+/* ===========================
+	Utilitas bersama
+=========================== */
 
 function ensureForm() {
 	if (!FORM.sip() || !FORM.act() || !FORM.key() || !FORM.captchaKey()) {
@@ -246,14 +638,11 @@ function ensureForm() {
 	}
 }
 
-// Snapshot gambar captcha jadi dataURL agar popup tidak memicu request baru
+// Membuat snapshot gambar captcha menjadi dataURL agar Popup tidak memicu request baru
 async function snapshotCaptcha(imgEl, imgUrl) {
 	try {
-		// Prioritas: gunakan elemen img yang ada di halaman
 		const src = imgEl ? imgEl.getAttribute("src") : imgUrl;
 		const abs = new URL(src, location.href).href;
-
-		// Jika imgEl tersedia dan sudah load, langsung capture
 		if (
 			imgEl &&
 			imgEl.complete &&
@@ -262,20 +651,49 @@ async function snapshotCaptcha(imgEl, imgUrl) {
 		) {
 			return captureElementToDataURL(imgEl);
 		}
-
-		// Jika belum load, coba muat di content world (synchronous ke origin yang sama)
 		const tmp = new Image();
-		// sama origin, tidak perlu crossOrigin
 		const loaded = await imageLoad(tmp, abs);
 		if (loaded) return drawToDataURL(tmp);
 
-		// Fallback terakhir: fetch blob lalu konversi ke dataURL
 		const res = await fetch(abs, { credentials: "include", cache: "no-store" });
 		const blob = await res.blob();
 		return await blobToDataURL(blob);
 	} catch {
-		return ""; // biarkan popup fallback ke imageUrl (terjadi hanya jika sangat perlu)
+		return "";
 	}
+}
+
+async function refreshCaptchaImage() {
+	const img = FORM.captchaImage();
+	if (!img) return;
+	const base = new URL(img.getAttribute("src"), location.href);
+	base.searchParams.set("_", String(Math.random()).slice(2));
+	const newUrl = base.href;
+	const loaded = await imageLoad(img, newUrl);
+	if (!loaded) return;
+
+	const imageDataUrl = captureElementToDataURL(img);
+	const { pendingAction } = await chrome.storage.local.get([
+		STATE_KEYS.PENDING,
+	]);
+	const meta = pendingAction
+		? {
+				title: `${
+					pendingAction.displayCode || pendingAction.valueCode
+				} — Kelas ${pendingAction.kelas}`,
+				desc: pendingAction.name || "",
+				kelas: String(pendingAction.kelas || ""),
+				kategori: String(pendingAction.kategori || ""),
+				attempt: pendingAction.attempt || 1,
+		  }
+		: null;
+
+	await chrome.runtime.sendMessage({
+		type: "NEED_CAPTCHA",
+		imageUrl: newUrl,
+		imageDataUrl,
+		meta,
+	});
 }
 
 function captureElementToDataURL(imgEl) {
@@ -323,45 +741,6 @@ function blobToDataURL(blob) {
 	});
 }
 
-// Saat refresh: ubah src di halaman (cache-bust), TUNGGU load, baru kirim dataURL baru
-async function refreshCaptchaImage() {
-	const img = FORM.captchaImage();
-	if (!img) return;
-
-	const base = new URL(img.getAttribute("src"), location.href);
-	base.searchParams.set("_", String(Math.random()).slice(2));
-	const newUrl = base.href;
-
-	const loaded = await imageLoad(img, newUrl); // menunggu load selesai
-	if (!loaded) return;
-
-	// pakai elemen yang sama untuk snapshot (pasti sama dengan yang akan divalidasi server)
-	const imageDataUrl = captureElementToDataURL(img);
-
-	// Ambil metadata kandidat dari storage untuk judul/desc/attempt
-	const { pendingAction } = await chrome.storage.local.get([
-		STATE_KEYS.PENDING,
-	]);
-	const meta = pendingAction
-		? {
-				title: `${
-					pendingAction.displayCode || pendingAction.valueCode
-				} — Kelas ${pendingAction.kelas}`,
-				desc: pendingAction.name || "",
-				kelas: String(pendingAction.kelas || ""),
-				kategori: String(pendingAction.kategori || ""),
-				attempt: pendingAction.attempt || 1,
-		  }
-		: null;
-
-	await chrome.runtime.sendMessage({
-		type: "NEED_CAPTCHA",
-		imageUrl: newUrl,
-		imageDataUrl, // kirim snapshot-nya
-		meta,
-	});
-}
-
 function parseAllClasses() {
 	const out = [];
 	for (const [kategori, sel] of Object.entries(SELECTORS)) {
@@ -370,11 +749,14 @@ function parseAllClasses() {
 			for (const opt of el.querySelectorAll("option")) {
 				const rawValue = opt.value || "";
 				if (!rawValue) continue;
+
 				const meta = parseOptionValue(rawValue);
 				const textRaw = getOptionText(opt);
 				const text = prepareTextForParsing(textRaw);
+
 				const cap = parseCapacityFlexible(text);
 				const disp = parseDisplayMetaRobust(text);
+
 				out.push({
 					kategori,
 					rawValue,
@@ -397,11 +779,14 @@ function parseAllClasses() {
 			for (const opt of sel.querySelectorAll("option")) {
 				const rawValue = opt.value || "";
 				if (!rawValue) continue;
+
 				const meta = parseOptionValue(rawValue);
 				const textRaw = getOptionText(opt);
 				const text = prepareTextForParsing(textRaw);
+
 				const cap = parseCapacityFlexible(text);
 				const disp = parseDisplayMetaRobust(text);
+
 				out.push({
 					kategori: "jurlain",
 					rawValue,
@@ -482,7 +867,6 @@ function parseDisplayMetaRobust(text) {
 			.join(" ")
 			.trim();
 	}
-
 	return { displayCode: codeGuess, name, sks };
 }
 
@@ -530,6 +914,7 @@ async function notify(title, message) {
 	} catch {}
 }
 
+// Mencari elemen <select> berdasarkan label (teks di kolom pertama pada FilterBox)
 function findSelectByLabel(labelText) {
 	const rows = document.querySelectorAll("table.FilterBox tr");
 	for (const tr of rows) {
@@ -542,4 +927,14 @@ function findSelectByLabel(labelText) {
 		}
 	}
 	return null;
+}
+
+// Utilitas kecil
+function escapeHtml(s) {
+	return String(s || "")
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#039;");
 }
