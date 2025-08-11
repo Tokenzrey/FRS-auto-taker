@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>FRS Auto-Taker</title>
+		<link rel="stylesheet" href="popup.css" />
+	</head>
+	<body>
+		<header>
+			<h1>FRS Auto-Taker</h1>
+			<div id="statusDot" class="dot idle" title="Idle"></div>
+		</header>
+
+		<section id="setupSection" hidden>
+			<div class="controls">
+				<input id="search" placeholder="Cari kode/nama/kelas/kategori..." />
+				<button id="refresh">Refresh</button>
+				<a class="link" href="options.html" target="_blank">Options</a>
+			</div>
+
+			<div class="columns">
+				<div class="col">
+					<h3>Semua Kelas (drag ke Prioritas)</h3>
+					<div id="classSections" class="sections"></div>
+				</div>
+
+				<div class="col">
+					<h3>Prioritas</h3>
+					<ul
+						id="priorityList"
+						class="list droptarget"
+						aria-label="Prioritas"></ul>
+					<div class="actions">
+						<button id="startBtn" class="primary">Start</button>
+						<button id="clearPriority">Clear</button>
+					</div>
+				</div>
+			</div>
+		</section>
+
+		<section id="huntSection" hidden>
+			<div class="card">
+				<div class="row">
+					<div class="grow">
+						<h3 id="targetTitle">Menyiapkan…</h3>
+						<div id="targetDesc" class="muted"></div>
+						<div id="attemptInfo"></div>
+					</div>
+					<button id="stopBtn">Stop</button>
+				</div>
+				<div class="captchaBox">
+					<img id="captchaPreview" alt="Captcha" />
+					<input id="captchaInput" placeholder="Ketik CAPTCHA lalu Enter" />
+					<div class="captchaActions">
+						<button id="captchaRefresh" type="button">Refresh</button>
+						<button id="captchaSubmit" class="primary" type="button">
+							Kirim
+						</button>
+					</div>
+				</div>
+				<div id="log"></div>
+			</div>
+		</section>
+
+		<script src="popup.js"></script>
+	</body>
+</html>

@@ -1,0 +1,259 @@
+/* Lebar popup */
+body {
+	font-family: system-ui, Arial, sans-serif;
+	margin: 0;
+	width: 720px;
+}
+header {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 10px 12px;
+	border-bottom: 1px solid #eee;
+	background: #fff;
+	position: sticky;
+	top: 0;
+	z-index: 2;
+}
+h1 {
+	font-size: 16px;
+	margin: 0;
+}
+.dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+}
+.dot.idle {
+	background: #bbb;
+}
+.dot.hunting {
+	background: #4caf50;
+}
+
+/* Controls */
+.controls {
+	display: flex;
+	gap: 8px;
+	padding: 10px 12px;
+	align-items: center;
+}
+.controls input {
+	flex: 1;
+	padding: 8px 10px;
+	border-radius: 8px;
+	border: 1px solid #ddd;
+}
+.controls .link {
+	text-decoration: none;
+	font-size: 12px;
+	color: #0067b1;
+}
+
+/* Layout */
+.columns {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 12px;
+	padding: 0 12px 12px;
+}
+.col {
+	border: 1px solid #eee;
+	border-radius: 10px;
+	padding: 10px;
+	min-height: 420px;
+	background: #fff;
+}
+h3 {
+	margin: 6px 0 10px;
+	font-size: 14px;
+}
+.muted {
+	color: #666;
+	font-size: 12px;
+	margin-top: 2px;
+}
+
+/* Sections (collapsible) */
+.sections {
+	display: grid;
+	gap: 10px;
+}
+.section {
+	border: 1px dashed #e8e8e8;
+	border-radius: 10px;
+	padding: 8px;
+}
+.section.collapsed {
+	opacity: 0.9;
+}
+.section-header {
+	width: 100%;
+	text-align: left;
+	background: #f7f9fc;
+	border: 1px solid #e7edf5;
+	border-radius: 8px;
+	padding: 6px 8px;
+	display: grid;
+	grid-template-columns: 20px 1fr auto;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+}
+.section-header .chev {
+	font-size: 12px;
+	color: #555;
+}
+.section-header .count {
+	font-size: 11px;
+	padding: 2px 8px;
+	border-radius: 999px;
+	background: #eef3f9;
+	color: #333;
+}
+
+/* Lists & items */
+.list {
+	list-style: none;
+	margin: 8px 0 0;
+	padding: 0;
+	max-height: 320px;
+	overflow: auto;
+	border: 1px solid #f0f0f0;
+	border-radius: 8px;
+	background: #fafafa;
+}
+.list li {
+	padding: 8px;
+	border-bottom: 1px solid #f2f2f2;
+	display: grid;
+	grid-template-columns: 20px 1fr auto;
+	gap: 8px;
+	align-items: center;
+	background: #fff;
+	cursor: grab;
+	transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+}
+.list li:last-child {
+	border-bottom: 0;
+}
+.list li.dragging {
+	opacity: 0.95;
+	transform: scale(1.02);
+	box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+	cursor: grabbing;
+}
+.list li.drop-before {
+	box-shadow: inset 0 3px 0 #4caf50;
+}
+.list.drop-at-end {
+	box-shadow: inset 0 -3px 0 #4caf50;
+}
+
+.drag-handle {
+	cursor: grab;
+	color: #999;
+	user-select: none;
+}
+.meta {
+	display: grid;
+	gap: 2px;
+}
+.item-title {
+	font-weight: 600;
+	font-size: 13px;
+	color: #222;
+}
+.item-sub {
+	font-size: 12px;
+	color: #555;
+}
+.badge {
+	font-size: 11px;
+	padding: 2px 6px;
+	border-radius: 999px;
+	background: #eee;
+	margin-left: 6px;
+}
+.badge.cap {
+	background: #f5f5f5;
+}
+
+/* Prioritas: drop area full column */
+.col.priority-drop {
+	outline: 2px dashed #4caf50;
+	outline-offset: -4px;
+}
+
+/* Kelas: highlight saat bisa drop (unselect) */
+.list.drop-target {
+	box-shadow: inset 0 0 0 2px rgba(76, 175, 80, 0.45);
+}
+
+/* Actions */
+.actions {
+	margin-top: 10px;
+	display: flex;
+	gap: 8px;
+	align-items: center;
+}
+button {
+	padding: 8px 12px;
+	border-radius: 8px;
+	border: 1px solid #ddd;
+	background: #fff;
+	cursor: pointer;
+	transition: transform 120ms ease, box-shadow 120ms ease;
+}
+button:hover {
+	transform: translateY(-1px);
+	box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+}
+button.primary {
+	background: #4caf50;
+	color: white;
+	border: none;
+}
+
+/* Hunt mode */
+.card {
+	padding: 12px;
+}
+.row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.grow {
+	flex: 1;
+}
+.captchaBox {
+	display: grid;
+	gap: 8px;
+	justify-items: center;
+	margin-top: 10px;
+}
+#captchaPreview {
+	width: 480px;
+	height: auto;
+	border: 1px solid #ddd;
+	border-radius: 8px;
+}
+#captchaInput {
+	width: 480px;
+	padding: 10px;
+	border-radius: 8px;
+	border: 1px solid #ddd;
+}
+.captchaActions {
+	display: flex;
+	gap: 8px;
+}
+#log {
+	margin-top: 10px;
+	font-size: 12px;
+	color: #666;
+	max-height: 120px;
+	overflow: auto;
+}

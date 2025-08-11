@@ -1,0 +1,26 @@
+body {
+	font-family: system-ui, Arial, sans-serif;
+	margin: 16px;
+	max-width: 640px;
+}
+h1 {
+	font-size: 18px;
+}
+label {
+	display: block;
+	margin: 12px 0;
+}
+input {
+	padding: 6px 8px;
+}
+button {
+	padding: 6px 10px;
+	border-radius: 8px;
+	border: 1px solid #ddd;
+	background: #fff;
+	cursor: pointer;
+}
+#msg {
+	margin-top: 10px;
+	color: #4caf50;
+}

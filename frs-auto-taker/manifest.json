@@ -1,0 +1,38 @@
+{
+	"manifest_version": 3,
+	"name": "FRS Auto-Taker",
+	"version": "1.0.0",
+	"description": "Otomasi ambil kelas FRS: prioritas drag-and-drop, input CAPTCHA (manual), retry cerdas.",
+	"action": {
+		"default_title": "FRS Auto-Taker",
+		"default_popup": "popup.html"
+	},
+	"options_page": "options.html",
+	"icons": {
+		"16": "assets/icon16.png",
+		"48": "assets/icon48.png",
+		"128": "assets/icon128.png"
+	},
+	"permissions": ["storage", "tabs", "scripting", "notifications"],
+	"host_permissions": ["*://*.its.ac.id/*"],
+	"background": {
+		"service_worker": "background.js",
+		"type": "module"
+	},
+	"content_scripts": [
+		{
+			"matches": [
+				"*://*.its.ac.id/*/list_frs.php*",
+				"*://*.its.ac.id/list_frs.php*"
+			],
+			"js": ["content.js"],
+			"run_at": "document_idle"
+		}
+	],
+	"web_accessible_resources": [
+		{
+			"resources": ["bridge.js"],
+			"matches": ["*://*.its.ac.id/*"]
+		}
+	]
+}
