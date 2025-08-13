@@ -1,25 +1,21 @@
 /*
- * Service Worker (Background)
- *
- * Peran:
- * - Menjadi pusat state global (chrome.storage.local)
- * - Bus pesan antara Popup dan Content Script
- * - Mengelola alur CAPTCHA, proses Hunting, dan Notify Extended
- */
-
-/**
- * Kunci-kunci state yang disimpan di chrome.storage.local
- * - PRIORITY: daftar kandidat prioritas untuk diambil
- * - RUNMODE: mode runtime ("idle" | "hunting")
- * - PENDING: informasi kandidat yang sedang dicoba (untuk evaluasi pasca reload)
- * - ACTIVE_INDEX: indeks kandidat aktif di daftar prioritas
- * - CLASSES: hasil parsing seluruh kelas { updatedAt, items }
- * - COLLAPSE: preferensi UI (status collapse per seksi) di Popup
- * - LAST_CAPTCHA: cache metadata captcha terakhir (url, snapshot, tabId, meta)
- * - NOTIFY_ENABLED: status Notify Extended (on/off)
- * - NOTIFY_BASELINE: baseline kuota per kandidat prioritas { [rawValue]: { kuota, ts } }
- * - NOTIFY_LAST_TS: timestamp pengecekan Notify Extended terakhir
- */
+ Dokumentasi
+ Nama Berkas: background.js
+ Deskripsi: Service worker ekstensi (MV3) yang mengoordinasikan state global, komunikasi antar komponen (popup, content, offscreen), alur hunting, CAPTCHA, dan Notify Extended.
+ Tanggung Jawab:
+ - Menyimpan serta memutakhirkan state di chrome.storage.local.
+ - Meneruskan dan merespon pesan runtime (chrome.runtime.onMessage).
+ - Mengelola siklus hidup audio offscreen untuk peringatan.
+ - Menangani toggle dan baseline Notify Extended.
+ - Menyampaikan hasil atau perintah ke content script (PRIORITY_UPDATED, NOTIFY_*).
+ Kunci Penyimpanan Utama:
+	 priority, runMode, pendingAction, activeCandidateIndex, classes, collapseSections,
+	 lastCaptcha, notifyExtendedEnabled, notifyExtendedBaseline, notifyExtendedLastCheckTs.
+ Pesan Utama:
+	 PLAY_BEEP, START_DISTURBING_BEEP, STOP_DISTURBING_BEEP, GET_STATE, SET_STATE,
+	 REORDER_PRIORITY, NEED_CAPTCHA, CAPTCHA_SUBMIT, STOP_HUNT, TOGGLE_NOTIFY_EXTENDED,
+	 NOTIFY_BUILD_BASELINE, NOTIFY_EXTENDED_FOUND, NOTIFY_SET_LAST_TS, NOTIFY_STATUS, NOTIFY.
+*/
 const STATE_KEYS = {
 	PRIORITY: "priority",
 	RUNMODE: "runMode",
@@ -28,14 +24,11 @@ const STATE_KEYS = {
 	CLASSES: "classes",
 	COLLAPSE: "collapseSections",
 	LAST_CAPTCHA: "lastCaptcha",
-
-	// Notify Extended
 	NOTIFY_ENABLED: "notifyExtendedEnabled",
-	NOTIFY_BASELINE: "notifyExtendedBaseline", // { [rawValue]: { kuota:number, ts:number } }
+	NOTIFY_BASELINE: "notifyExtendedBaseline",
 	NOTIFY_LAST_TS: "notifyExtendedLastCheckTs",
 };
 
-// Inisialisasi nilai default saat ekstensi terpasang/diupdate
 chrome.runtime.onInstalled.addListener(async () => {
 	const st = await chrome.storage.local.get(null);
 	const set = {};
@@ -45,10 +38,45 @@ chrome.runtime.onInstalled.addListener(async () => {
 	if (Object.keys(set).length) await chrome.storage.local.set(set);
 });
 
-// Bus pesan terpusat antara Popup dan Content Script
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+	/**
+	 * Router pesan utama service worker.
+	 * Menangani audio offscreen, state, prioritas, captcha, serta notify extended.
+	 */
 	(async () => {
 		switch (msg?.type) {
+			case "PLAY_BEEP": {
+				try {
+					await AudioClient.ensureOffscreenReady();
+					await AudioClient.playBeep(msg.options || {});
+					sendResponse({ ok: true });
+				} catch (e) {
+					sendResponse({ ok: false, error: String(e) });
+				}
+				break;
+			}
+
+			case "START_DISTURBING_BEEP": {
+				try {
+					await AudioClient.ensureOffscreenReady();
+					await AudioClient.startLoop(msg.options || {});
+					sendResponse({ ok: true });
+				} catch (e) {
+					sendResponse({ ok: false, error: String(e) });
+				}
+				break;
+			}
+
+			case "STOP_DISTURBING_BEEP": {
+				try {
+					await AudioClient.ensureOffscreenReady();
+					await AudioClient.stopLoop();
+					sendResponse({ ok: true });
+				} catch (e) {
+					sendResponse({ ok: false, error: String(e) });
+				}
+				break;
+			}
 			case "GET_STATE": {
 				const all = await chrome.storage.local.get(null);
 				sendResponse(all);
@@ -77,7 +105,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 				break;
 			}
 
-			// Sumber kebenaran tunggal untuk CAPTCHA (URL, snapshot dataURL, dan meta)
 			case "NEED_CAPTCHA": {
 				const imageUrl = msg.imageUrl || null;
 				const imageDataUrl = msg.imageDataUrl || null;
@@ -125,10 +152,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 				break;
 			}
 
-			// Toggle Notify Extended (hanya boleh ON saat Idle)
 			case "TOGGLE_NOTIFY_EXTENDED": {
 				const { enable } = msg;
-				// validasi: hanya boleh enable jika idle
 				const st = await chrome.storage.local.get([STATE_KEYS.RUNMODE]);
 				if (enable && st[STATE_KEYS.RUNMODE] !== "idle") {
 					sendResponse({
@@ -157,7 +182,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 			}
 
 			case "NOTIFY_BUILD_BASELINE": {
-				// Minta Content melakukan parse & membangun baseline terbaru
 				try {
 					const [tab] = await chrome.tabs.query({
 						active: true,
@@ -174,7 +198,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 			}
 
 			case "NOTIFY_EXTENDED_FOUND": {
-				// Content mengabarkan ada kuota bertambah → matikan flag notify agar UI konsisten
 				await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_ENABLED]: false });
 				sendResponse({ ok: true });
 				break;
@@ -226,6 +249,91 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function getActiveTabId() {
+	/** Mengambil tabId aktif pada jendela saat ini. */
 	const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 	return tab?.id || null;
 }
+
+/**
+ * AudioClient
+ * Facade to communicate with the offscreen audio page with retries and readiness checks.
+ */
+const AudioClient = {
+	/** Ensure offscreen document is created and ready. */
+	async ensureOffscreenReady() {
+		try {
+			console.log("[FRS][AudioClient] ensureOffscreenReady: checking...");
+		} catch {}
+		const has = await chrome.offscreen.hasDocument?.();
+		if (!has) {
+			try {
+				console.log("[FRS][AudioClient] creating offscreen document...");
+			} catch {}
+			await chrome.offscreen.createDocument({
+				url: "offscreen.html",
+				reasons: [chrome.offscreen.Reason.AUDIO_PLAYBACK],
+				justification:
+					"Memutar suara peringatan saat Notify Extended tanpa interaksi pengguna",
+			});
+			await this._sleep(150);
+			try {
+				console.log("[FRS][AudioClient] offscreen created");
+			} catch {}
+		}
+	},
+	/** Play a single beep via offscreen. */
+	async playBeep(options) {
+		try {
+			console.log("[FRS][AudioClient] playBeep");
+		} catch {}
+		return await this._withRetry(
+			() =>
+				chrome.runtime.sendMessage({ type: "OFFSCREEN_PLAY_BEEP", options }),
+			5,
+			150
+		);
+	},
+	/** Start a repeating loop via offscreen. */
+	async startLoop(options) {
+		try {
+			console.log("[FRS][AudioClient] startLoop", options);
+		} catch {}
+		return await this._withRetry(
+			() =>
+				chrome.runtime.sendMessage({
+					type: "OFFSCREEN_START_BEEP_LOOP",
+					options,
+				}),
+			5,
+			150
+		);
+	},
+	/** Stop any running loop via offscreen. */
+	async stopLoop() {
+		try {
+			console.log("[FRS][AudioClient] stopLoop");
+		} catch {}
+		return await this._withRetry(
+			() => chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP_BEEP" }),
+			5,
+			150
+		);
+	},
+	/** Utilitas retry sederhana untuk panggilan runtime. */
+	async _withRetry(fn, maxAttempts, delayMs) {
+		let lastErr;
+		for (let i = 1; i <= maxAttempts; i++) {
+			try {
+				return await fn();
+			} catch (e) {
+				lastErr = e;
+				if (i < maxAttempts) await this._sleep(delayMs);
+			}
+		}
+		throw lastErr || new Error("AudioClient call failed");
+	},
+	/** Delay utilitas. */
+	_sleep(ms) {
+		return new Promise((r) => setTimeout(r, ms));
+	},
+};

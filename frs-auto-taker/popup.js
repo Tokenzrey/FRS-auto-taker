@@ -1,4 +1,14 @@
-// Kunci-kunci state yang digunakan Popup (sinkron dengan Background/Content)
+/*
+ Dokumentasi
+ Nama Berkas: popup.js
+ Deskripsi: Antarmuka pengguna popup untuk mengelola prioritas, memulai/menghentikan hunting, mengaktifkan Notify Extended, dan memasukkan CAPTCHA.
+ Tanggung Jawab:
+ - Menampilkan daftar kelas dan prioritas serta mendukung drag-and-drop.
+ - Mengendalikan mode runtime (idle/hunting) dan perintah ke content script.
+ - Mengambil dan menampilkan CAPTCHA terakhir (lastCaptcha) serta mengirimkan nilainya.
+ - Mengelola toggle Notify Extended dan sinkronisasi status UI.
+ Dependensi: chrome.runtime messaging, chrome.storage.local, DOM popup.html.
+*/
 const STATE_KEYS = {
 	PRIORITY: "priority",
 	RUNMODE: "runMode",
@@ -12,7 +22,6 @@ const STATE_KEYS = {
 	NOTIFY_LAST_TS: "notifyExtendedLastCheckTs",
 };
 
-// Label kategori untuk tampilan UI
 const LABELS = {
 	jur: "Kelas Dep.",
 	jurlain: "Kelas Dep. Lain",
@@ -21,7 +30,6 @@ const LABELS = {
 	mbkm: "Kelas MBKM",
 };
 
-// Referensi elemen UI utama
 const els = {
 	statusDot: document.getElementById("statusDot"),
 	setupSection: document.getElementById("setupSection"),
@@ -29,6 +37,7 @@ const els = {
 
 	search: document.getElementById("search"),
 	refresh: document.getElementById("refresh"),
+	testBeep: document.getElementById("testBeep"),
 
 	classSections: document.getElementById("classSections"),
 	priorityList: document.getElementById("priorityList"),
@@ -46,7 +55,6 @@ const els = {
 	captchaRefresh: document.getElementById("captchaRefresh"),
 	log: document.getElementById("log"),
 
-	// Elemen untuk Notify Extended
 	notifyToggle: document.getElementById("notifyToggle"),
 	notifyBadge: document.getElementById("notifyBadge"),
 	notifyHint: document.getElementById("notifyHint"),
@@ -63,31 +71,31 @@ let collapseState = {
 };
 let dragging = null;
 
-// Inisialisasi Popup
 init().catch(console.error);
 
+/**
+ * Inisialisasi UI popup, binding event, dan sinkronisasi state awal.
+ */
 async function init() {
-	// Muat state awal, setup UI mode, dan pasang event handler
 	const st = await getState();
 	window.__stateCache = st;
 
 	classesCache = st[STATE_KEYS.CLASSES]?.items || [];
 	collapseState = Object.assign(collapseState, st["collapseSections"] || {});
 
-	// Status awal toggle Notify Extended
 	const notifyEnabled = !!st[STATE_KEYS.NOTIFY_ENABLED];
 	els.notifyToggle.checked = notifyEnabled;
 
-	// Mode UI awal (Idle vs Hunting)
-	if (st[STATE_KEYS.RUNMODE] === "hunting") enterHuntUI();
+	if (st[STATE_KEYS.LAST_CAPTCHA]) enterHuntUI();
+	else if (st[STATE_KEYS.RUNMODE] === "hunting") enterHuntUI();
 	else enterSetupUI();
 
-	// Event handler
 	els.search.addEventListener("input", () => {
 		filterText = els.search.value.trim();
 		renderClassSections(getPrioritySync());
 	});
 	els.refresh.addEventListener("click", refreshClasses);
+	els.testBeep.addEventListener("click", testBeep);
 	els.startBtn.addEventListener("click", startHunt);
 	els.clearPriority.addEventListener("click", () =>
 		savePriority([]).then(() => renderClassSections([]))
@@ -101,7 +109,6 @@ async function init() {
 
 	els.notifyToggle.addEventListener("change", onToggleNotify);
 
-	// Dengarkan perubahan storage untuk captcha, runMode, dan notify
 	chrome.storage.onChanged.addListener(async (changes, area) => {
 		if (area !== "local") return;
 
@@ -121,10 +128,16 @@ async function init() {
 		}
 
 		if (changes[STATE_KEYS.RUNMODE]?.newValue) {
-			if (changes[STATE_KEYS.RUNMODE].newValue === "idle") {
-				enterSetupUI();
-			} else if (changes[STATE_KEYS.RUNMODE].newValue === "hunting") {
+			const newMode = changes[STATE_KEYS.RUNMODE].newValue;
+			if (newMode === "hunting") {
 				enterHuntUI();
+			} else if (newMode === "idle") {
+				const all = await getState();
+				if (all[STATE_KEYS.LAST_CAPTCHA]) {
+					enterHuntUI();
+				} else {
+					enterSetupUI();
+				}
 			}
 		}
 
@@ -135,9 +148,8 @@ async function init() {
 		}
 	});
 
-	// Jika sedang hunting, tampilkan CAPTCHA/meta terakhir
 	const lc = st[STATE_KEYS.LAST_CAPTCHA];
-	if (lc && st[STATE_KEYS.RUNMODE] === "hunting") {
+	if (lc) {
 		const nextSrc = lc.imageDataUrl || lc.imageUrl || "";
 		if (nextSrc && els.captchaPreview.src !== nextSrc) {
 			els.captchaPreview.src = nextSrc;
@@ -153,13 +165,10 @@ async function init() {
 	setupDragAndDrop();
 }
 
-/* ---------- Notify Extended (UI) ---------- */
-
 async function onToggleNotify() {
 	const on = els.notifyToggle.checked;
 	const st = await getState();
 	if (st[STATE_KEYS.RUNMODE] !== "idle" && on) {
-		// Tidak bisa mengaktifkan saat tidak Idle
 		els.notifyToggle.checked = false;
 		return;
 	}
@@ -168,7 +177,6 @@ async function onToggleNotify() {
 		enable: on,
 	});
 	if (on) {
-		// Bangun baseline terbaru
 		await chrome.runtime.sendMessage({ type: "NOTIFY_BUILD_BASELINE" });
 	}
 	updateNotifyUI(on);
@@ -177,7 +185,6 @@ async function onToggleNotify() {
 function updateNotifyUI(on) {
 	els.notifyBadge.textContent = on ? "On" : "Off";
 	els.notifyBadge.className = `badge ${on ? "live" : "muted"}`;
-	// Saat Notify ON → disable Start agar tidak bentrok (kebijakan)
 	els.startBtn.disabled = on;
 	els.startBtn.title = on
 		? "Matikan Notify Extended untuk memulai Hunting"
@@ -187,7 +194,6 @@ function updateNotifyUI(on) {
 		: "Memantau kenaikan kuota untuk kelas di Prioritas. Hanya bisa diaktifkan saat Idle.";
 }
 
-/* ---------- Mode UI ---------- */
 function enterHuntUI() {
 	setDot("hunting");
 	els.setupSection.hidden = true;
@@ -204,8 +210,6 @@ function setDot(kind) {
 	els.statusDot.className = `dot ${kind}`;
 	els.statusDot.title = kind === "hunting" ? "Hunting" : "Idle";
 }
-
-/* ---------- Umum ---------- */
 
 async function getState() {
 	return await chrome.runtime.sendMessage({ type: "GET_STATE" });
@@ -272,7 +276,6 @@ function renderClassSections(priority) {
 		els.classSections.appendChild(section);
 	}
 
-	// Kolom Prioritas
 	els.priorityList.innerHTML = "";
 	for (const p of priority) els.priorityList.appendChild(classItem(p, true));
 
@@ -371,6 +374,15 @@ async function submitCaptcha() {
 }
 
 async function refreshCaptcha() {
+	const lc = await chrome.storage.local.get([STATE_KEYS.LAST_CAPTCHA]);
+	const tabId = lc[STATE_KEYS.LAST_CAPTCHA]?.tabId;
+	if (tabId) {
+		try {
+			await chrome.tabs.sendMessage(tabId, { type: "REFRESH_CAPTCHA" });
+			log("CAPTCHA di-refresh.");
+			return;
+		} catch {}
+	}
 	const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 	if (!tab?.id) return;
 	await chrome.tabs.sendMessage(tab.id, { type: "REFRESH_CAPTCHA" });
@@ -383,7 +395,6 @@ function log(s) {
 	els.log.prepend(line);
 }
 
-/* ---------- Metadata target ---------- */
 function renderTargetMeta(meta) {
 	if (!meta) {
 		els.targetTitle.textContent = "Menyiapkan…";
@@ -398,7 +409,6 @@ function renderTargetMeta(meta) {
 	}
 }
 
-/* ---------- Drag & Drop ---------- */
 function setupDragAndDrop() {
 	document.addEventListener("dragstart", (e) => {
 		const li = e.target.closest("li");
@@ -523,7 +533,6 @@ function clearDropIndicators() {
 		.forEach((el) => el.classList.remove("drop-before"));
 }
 
-/* ---------- Utilitas ---------- */
 function groupBy(arr, key) {
 	return arr.reduce((acc, it) => {
 		const k = it[key] || "";
@@ -538,4 +547,26 @@ function escapeHtml(s) {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;")
 		.replace(/'/g, "&#039;");
+}
+
+async function testBeep() {
+	try {
+		await chrome.runtime.sendMessage({
+			type: "START_DISTURBING_BEEP",
+			options: {
+				totalDurationMs: 2000,
+				stepMs: 120,
+				gain: 1,
+				freqHigh: 1600,
+				freqLow: 700,
+			},
+		});
+	} catch (e) {
+		try {
+			await chrome.runtime.sendMessage({
+				type: "PLAY_BEEP",
+				options: { frequency: 1000, durationMs: 800, gain: 1 },
+			});
+		} catch {}
+	}
 }

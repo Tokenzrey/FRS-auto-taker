@@ -1,13 +1,21 @@
+/*
+ Dokumentasi
+ Nama Berkas: captcha.js
+ Deskripsi: Tampilan minimal untuk menampilkan gambar CAPTCHA dan mengirim nilai ke tab FRS sumber.
+ Tanggung Jawab:
+ - Memantau perubahan lastCaptcha dan memperbarui pratinjau gambar.
+ - Mengirim nilai CAPTCHA serta memperbarui URL saat refresh.
+ Dependensi: chrome.runtime messaging, chrome.storage.local.
+*/
 const img = document.getElementById("captchaImg");
 const val = document.getElementById("captchaVal");
 const refreshBtn = document.getElementById("refreshBtn");
 const submitBtn = document.getElementById("submitBtn");
 
-// Dialog CAPTCHA: menampilkan gambar, input, dan aksi refresh/submit
 init().catch(console.error);
 
+/** Inisialisasi tampilan captcha dan binding event. */
 async function init() {
-	// Ambil URL captcha terakhir dari storage dan pasang event handler
 	const lc = await chrome.storage.local.get(["lastCaptcha"]);
 	const imageUrl = lc.lastCaptcha?.imageUrl;
 	img.src = imageUrl || "";
@@ -19,7 +27,6 @@ async function init() {
 	});
 	refreshBtn.addEventListener("click", refreshImg);
 
-	// Sinkronisasi jika gambar CAPTCHA diperbarui dari content script
 	chrome.storage.onChanged.addListener((changes, area) => {
 		if (area !== "local") return;
 		if (changes.lastCaptcha?.newValue?.imageUrl) {
@@ -28,6 +35,7 @@ async function init() {
 	});
 }
 
+/** Kirim nilai captcha ke tab sumber FRS. */
 async function submit() {
 	const lc = await chrome.storage.local.get(["lastCaptcha"]);
 	const tabId = lc.lastCaptcha?.tabId;
@@ -37,12 +45,11 @@ async function submit() {
 	val.value = "";
 }
 
+/** Refresh gambar captcha dan sinkronkan URL ke storage. */
 async function refreshImg() {
-	// Tambahkan parameter acak agar gambar tidak di-cache
 	const url = new URL(img.src);
 	url.searchParams.set("_", String(Math.random()).slice(2));
 	img.src = url.href;
-	// Perbarui storage agar komponen lain ikut tersinkron
 	const lc = await chrome.storage.local.get(["lastCaptcha"]);
 	await chrome.storage.local.set({
 		lastCaptcha: { ...(lc.lastCaptcha || {}), imageUrl: img.src },

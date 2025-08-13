@@ -1,12 +1,20 @@
 /*
- * Agent untuk halaman list_frs.php
- *
- * Fungsionalitas:
- * - Parsing kelas (sedini mungkin) dan penyimpanan ke storage
- * - Proses ambil kelas (Hunting) + evaluasi hasil setelah reload
- * - Pusat CAPTCHA (snapshot dataURL, refresh, submit)
- * - Notify Extended (pantau kenaikan kuota, tampilkan overlay+suara, auto mulai hunting)
- */
+ Dokumentasi
+ Nama Berkas: content.js
+ Deskripsi: Agen halaman FRS (list_frs.php) untuk parsing data kelas, eksekusi pengambilan (hunting), penanganan CAPTCHA, dan pemantauan kenaikan kuota (Notify Extended).
+ Tanggung Jawab:
+ - Mengurai opsi kelas dari DOM dan menyimpannya ke chrome.storage.local.
+ - Menjalankan alur hunting kandidat prioritas serta mengevaluasi hasil setelah muat ulang.
+ - Menangani permintaan CAPTCHA (snapshot, refresh, submit) dan mengirimkannya ke Popup.
+ - Memantau kenaikan kuota kelas prioritas dan memicu hunting berbasis antrean.
+ Kunci Penyimpanan:
+ - priority, runMode, pendingAction, activeCandidateIndex, classes, lastCaptcha,
+	 notifyExtendedEnabled, notifyExtendedBaseline, notifyExtendedLastCheckTs, notifyExtendedQueue.
+ Pesan Runtime:
+ - START_HUNT, PRIORITY_UPDATED, CAPTCHA_VALUE, REFRESH_CAPTCHA,
+	 NOTIFY_EXTENDED_START/STOP, NOTIFY_BUILD_BASELINE.
+ Dependensi: DOM list_frs.php, chrome.storage.local, chrome.runtime messaging.
+*/
 
 const SELECTORS = {
 	jur: "#kelasjur",
@@ -33,19 +41,19 @@ const STATE_KEYS = {
 	ACTIVE_INDEX: "activeCandidateIndex",
 	CLASSES: "classes",
 	LAST_CAPTCHA: "lastCaptcha",
-
-	// Notify Extended
 	NOTIFY_ENABLED: "notifyExtendedEnabled",
-	NOTIFY_BASELINE: "notifyExtendedBaseline", // { [rawValue]: { kuota, ts } }
+	NOTIFY_BASELINE: "notifyExtendedBaseline",
 	NOTIFY_LAST_TS: "notifyExtendedLastCheckTs",
+	NOTIFY_QUEUE: "notifyExtendedQueue",
 };
 
-// Early DOM Sniffer: mem-parsing kelas segera saat opsi muncul
-// Tujuan: mengurangi jeda, tidak menunggu render/DOMContentLoaded
 earlyParseWhenOptionsReady();
 
+/**
+ * Inisiasi parsing DOM awal untuk mengekstrak data kelas sedini mungkin.
+ * Menggunakan MutationObserver dan retry singkat agar robust saat elemen terlambat muncul.
+ */
 function earlyParseWhenOptionsReady() {
-	// gabungan semua selector yang mungkin berisi kelas
 	const ALL_SELECTORS = [
 		SELECTORS.jur,
 		SELECTORS.jurlain,
@@ -65,7 +73,6 @@ function earlyParseWhenOptionsReady() {
 		const selects = Array.from(document.querySelectorAll(ALL_SELECTORS));
 		if (!selects.length) return;
 
-		// cek apakah SUDAH ada opsi bermakna (value bukan string kosong)
 		const hasUsefulOptions = selects.some((sel) =>
 			Array.from(sel.options || []).some(
 				(opt) => (opt.value || "").trim() !== ""
@@ -73,7 +80,6 @@ function earlyParseWhenOptionsReady() {
 		);
 		if (!hasUsefulOptions) return;
 
-		// saat opsi sudah ada → parse segera
 		const classes = parseAllClasses();
 		chrome.storage.local.set({
 			[STATE_KEYS.CLASSES]: { updatedAt: Date.now(), items: classes },
@@ -83,10 +89,8 @@ function earlyParseWhenOptionsReady() {
 		if (mo) mo.disconnect();
 	};
 
-	// 1) Coba sinkron (jika sudah ada)
 	tryParse();
 
-	// 2) Jika belum ada, observasi DOM untuk menangkap momen pertama opsi muncul
 	if (!parsedOnce) {
 		mo = new MutationObserver(() => {
 			tryParse();
@@ -96,15 +100,11 @@ function earlyParseWhenOptionsReady() {
 			subtree: true,
 		});
 
-		// 3) Fallback: coba ulang beberapa kali awal (ringan, non-spam)
 		let retries = 10;
 		const tick = () => {
 			if (parsedOnce) return;
 			tryParse();
-			if (!parsedOnce && --retries > 0) {
-				// gunakan micro-delay kecil supaya responsif
-				setTimeout(tick, 50);
-			}
+			if (!parsedOnce && --retries > 0) setTimeout(tick, 50);
 		};
 		setTimeout(tick, 0);
 	}
@@ -112,16 +112,17 @@ function earlyParseWhenOptionsReady() {
 
 let MAX_CAPTCHA_ATTEMPTS = 8;
 const BACKOFF_MS = 3000;
-
-// Notify Extended runtime
 let notifyTimer = null;
-let notifyIntervalMs = 30000; // default; bisa ditimpa dari Options
+let notifyIntervalMs = 30000;
 const OVERLAY_ID = "frs-ext-notify-overlay";
 
 init().catch(console.error);
 
+/**
+ * Titik masuk utama content script.
+ * - Memuat opsi, menyimpan cache kelas, memulai notify/hunting sesuai state.
+ */
 async function init() {
-	// Muat opsi dari Options
 	try {
 		const { opts } = await chrome.storage.local.get(["opts"]);
 		if (opts?.maxCaptcha) MAX_CAPTCHA_ATTEMPTS = opts.maxCaptcha;
@@ -129,22 +130,18 @@ async function init() {
 			notifyIntervalMs = Math.max(5, +opts.notifyIntervalSec) * 1000;
 	} catch {}
 
-	// Parse kelas saat halaman siap
 	const classes = parseAllClasses();
 	await chrome.storage.local.set({
 		[STATE_KEYS.CLASSES]: { updatedAt: Date.now(), items: classes },
 	});
 
-	// Notify Extended: jalankan siklus awal saat load (jika aktif)
 	const { notifyExtendedEnabled } = await chrome.storage.local.get([
 		STATE_KEYS.NOTIFY_ENABLED,
 	]);
 	if (notifyExtendedEnabled) {
-		// 1) bandingkan baseline (jika ada), 2) jika tidak extended, jadwalkan reload berikutnya
 		await notifyCheckAndSchedule();
 	}
 
-	// Jika sedang hunting: evaluasi pending lalu lanjut
 	const { priority, runMode } = await chrome.storage.local.get([
 		STATE_KEYS.PRIORITY,
 		STATE_KEYS.RUNMODE,
@@ -160,7 +157,6 @@ async function init() {
 	}
 }
 
-// Listener pesan dari Background/Popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 	(async () => {
 		switch (msg?.type) {
@@ -174,18 +170,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 				sendResponse({ ok: true });
 				break;
 
-			case "PRIORITY_UPDATED":
+			case "PRIORITY_UPDATED": {
 				await chrome.storage.local.set({ [STATE_KEYS.ACTIVE_INDEX]: 0 });
-				// Jika notify extended ON → rebuild baseline agar akurat
-				{
-					const { notifyExtendedEnabled } = await chrome.storage.local.get([
-						STATE_KEYS.NOTIFY_ENABLED,
-					]);
-					if (notifyExtendedEnabled) await buildNotifyBaseline();
+				const st = await chrome.storage.local.get([
+					STATE_KEYS.RUNMODE,
+					STATE_KEYS.NOTIFY_ENABLED,
+				]);
+				if (st[STATE_KEYS.NOTIFY_ENABLED]) {
+					await buildNotifyBaseline();
 				}
-				await huntNext(true);
+				if (st[STATE_KEYS.RUNMODE] === "hunting") {
+					await huntNext(true);
+				} else {
+					console.log(
+						"[FRS][Flow] PRIORITY_UPDATED: runMode != hunting, skip auto hunt"
+					);
+				}
 				sendResponse({ ok: true });
 				break;
+			}
 
 			case "CAPTCHA_VALUE":
 				await submitWithCaptcha(msg.value);
@@ -197,7 +200,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 				sendResponse({ ok: true });
 				break;
 
-			// Notify Extended controls
 			case "NOTIFY_EXTENDED_START":
 				await enableNotifyWatcher(true);
 				sendResponse({ ok: true });
@@ -220,34 +222,86 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 	return true;
 });
 
-/* ===========================
-	Hunting (inti)
-=========================== */
-
+/**
+ * Menentukan kandidat berikutnya untuk dicoba dan memulai proses pengambilan.
+ * @param {boolean} [forceTop=false] Jika true, mulai dari elemen paling atas.
+ */
 async function huntNext(forceTop = false) {
+	console.log("[FRS][Flow] huntNext START", { forceTop, ts: Date.now() });
 	const st = await chrome.storage.local.get([
 		STATE_KEYS.PRIORITY,
 		STATE_KEYS.ACTIVE_INDEX,
+		STATE_KEYS.NOTIFY_QUEUE,
 		STATE_KEYS.RUNMODE,
 	]);
-	if (st[STATE_KEYS.RUNMODE] !== "hunting") return;
 	const priority = st[STATE_KEYS.PRIORITY] || [];
-	if (!priority.length) return;
+	const queue = Array.isArray(st[STATE_KEYS.NOTIFY_QUEUE])
+		? st[STATE_KEYS.NOTIFY_QUEUE]
+		: [];
+	if (!priority.length) {
+		console.log("[FRS][Flow] huntNext ABORT: empty priority list");
+		return;
+	}
+	if (st[STATE_KEYS.RUNMODE] !== "hunting" && !queue.length) {
+		console.log(
+			"[FRS][Flow] huntNext ABORT: runMode != hunting and queue empty"
+		);
+		return;
+	}
+	console.log("[FRS][Flow] huntNext state", {
+		activeIndex: st[STATE_KEYS.ACTIVE_INDEX],
+		queue,
+	});
+
+	if (queue.length) {
+		const nextRaw = forceTop ? queue[0] : queue[0];
+		const idx = priority.findIndex((p) => p.rawValue === nextRaw);
+		if (idx < 0) {
+			queue.shift();
+			await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_QUEUE]: queue });
+			console.warn("[FRS][Flow] Removed invalid queue item", nextRaw, {
+				queue,
+			});
+			return await huntNext(true);
+		}
+		const candidate = priority[idx];
+		console.log("[FRS][Flow] huntNext -> trying extended candidate", {
+			rawValue: candidate.rawValue,
+			idx,
+		});
+		await tryTakeCandidate(candidate, idx);
+		return;
+	}
 
 	const idx = forceTop ? 0 : st[STATE_KEYS.ACTIVE_INDEX] || 0;
 	if (idx >= priority.length) {
 		await notify("Selesai", "Semua kandidat sudah dicoba.");
 		await chrome.storage.local.set({
 			[STATE_KEYS.RUNMODE]: "idle",
-			[STATE_KEYS.PENDING]: null,
+			[STATE_KEYS.ACTIVE_INDEX]: 0,
 		});
+		console.log("[FRS][Flow] huntNext complete: exhausted priority list");
 		return;
 	}
 	const candidate = priority[idx];
+	console.log("[FRS][Flow] huntNext -> trying normal candidate", {
+		rawValue: candidate.rawValue,
+		idx,
+	});
 	await tryTakeCandidate(candidate, idx);
 }
 
+/**
+ * Menyiapkan form dan data untuk mencoba mengambil satu kandidat kelas.
+ * Mengambil snapshot CAPTCHA dan mengumumkannya ke background/popup.
+ * @param {Object} candidate Objek kelas prioritas.
+ * @param {number} index Indeks kandidat pada daftar prioritas.
+ */
 async function tryTakeCandidate(candidate, index) {
+	console.log("[FRS][Flow] tryTakeCandidate START", {
+		rawValue: candidate.rawValue,
+		index,
+	});
 	const pending = {
 		rawValue: candidate.rawValue,
 		valueCode: candidate.valueCode,
@@ -263,12 +317,15 @@ async function tryTakeCandidate(candidate, index) {
 		[STATE_KEYS.ACTIVE_INDEX]: index,
 	});
 
-	// CAPTCHA: gunakan snapshot dataURL agar popup tidak memicu request ulang
 	const imgEl = FORM.captchaImage();
 	const imgUrl = imgEl
 		? new URL(imgEl.getAttribute("src"), location.href).href
 		: new URL("/securimage/securimage_show.php", location.href).href;
 	const imageDataUrl = await snapshotCaptcha(imgEl, imgUrl);
+	console.log("[FRS][Flow] tryTakeCandidate captcha snapshot", {
+		rawValue: candidate.rawValue,
+		hasImage: !!imageDataUrl,
+	});
 
 	const meta = {
 		title: `${pending.displayCode || pending.valueCode} — Kelas ${
@@ -280,12 +337,41 @@ async function tryTakeCandidate(candidate, index) {
 		attempt: pending.attempt || 1,
 	};
 
-	await chrome.runtime.sendMessage({
-		type: "NEED_CAPTCHA",
-		imageUrl: imgUrl,
-		imageDataUrl,
-		meta,
-	});
+	try {
+		await chrome.runtime.sendMessage({
+			type: "NEED_CAPTCHA",
+			imageUrl: imgUrl,
+			imageDataUrl,
+			meta,
+		});
+		try {
+			await chrome.storage.local.set({
+				[STATE_KEYS.LAST_CAPTCHA]: {
+					imageUrl: imgUrl,
+					imageDataUrl,
+					tabId: null,
+					meta,
+					ts: Date.now(),
+				},
+			});
+		} catch {}
+	} catch (e) {
+		try {
+			await chrome.storage.local.set({
+				[STATE_KEYS.LAST_CAPTCHA]: {
+					imageUrl: imgUrl,
+					imageDataUrl,
+					tabId: null,
+					meta,
+					ts: Date.now(),
+				},
+			});
+		} catch {}
+		console.warn(
+			"[FRS][Flow] tryTakeCandidate NEED_CAPTCHA send failed, fallback set",
+			{ rawValue: candidate.rawValue, error: e }
+		);
+	}
 
 	ensureForm();
 	FORM.act().value = "ambil";
@@ -293,7 +379,10 @@ async function tryTakeCandidate(candidate, index) {
 	FORM.captchaKey().value = "";
 	FORM.captchaInput()?.focus();
 }
-
+/**
+ * Mengisi nilai CAPTCHA ke form dan submit.
+ * @param {string} value Nilai CAPTCHA.
+ */
 async function submitWithCaptcha(value) {
 	const ci = FORM.captchaInput();
 	if (ci) ci.value = value;
@@ -301,124 +390,226 @@ async function submitWithCaptcha(value) {
 	FORM.sip().submit();
 }
 
+/**
+ * Mengevaluasi hasil setelah halaman termuat ulang untuk kandidat yang barusan dicoba.
+ * Mengelola antrean notify dan penyesuaian indeks aktif.
+ * @param {Object} pending Informasi kandidat yang diproses.
+ */
 async function evaluateAfterReload(pending) {
+	console.log("[FRS][Flow] evaluateAfterReload START", {
+		rawValue: pending?.rawValue,
+		ts: Date.now(),
+	});
+	const stQ = await chrome.storage.local.get([STATE_KEYS.NOTIFY_QUEUE]);
+	const queueAtStart = Array.isArray(stQ[STATE_KEYS.NOTIFY_QUEUE])
+		? stQ[STATE_KEYS.NOTIFY_QUEUE]
+		: [];
 	const ok =
 		isCandidateInGrid(pending.displayCode, pending.kelas) ||
 		isCandidateInGrid(pending.valueCode, pending.kelas);
 	if (ok) {
+		console.log("[FRS][Flow] evaluateAfterReload SUCCESS", {
+			rawValue: pending.rawValue,
+		});
 		await notify(
 			"Berhasil",
 			`Berhasil ambil ${pending.displayCode || pending.valueCode} kelas ${
 				pending.kelas
 			}.`
 		);
-		await chrome.storage.local.set({
-			[STATE_KEYS.PENDING]: null,
-			[STATE_KEYS.ACTIVE_INDEX]: (await getActiveIndex()) + 1,
-		});
-		return;
-	}
-
-	const classes = parseAllClasses();
-	const found = classes.find((c) => c.rawValue === pending.rawValue);
-	let captchaError = true;
-	if (found) {
-		const { terisi, kuota } = found.kapasitas || {};
-		if (typeof terisi === "number" && typeof kuota === "number") {
-			if (kuota === 0 || terisi >= kuota) captchaError = false;
-		}
-	}
-
-	if (!captchaError) {
-		await notify(
-			"Kelas penuh",
-			`${pending.displayCode || pending.valueCode} kelas ${
-				pending.kelas
-			} penuh. Lanjut kandidat berikut.`
-		);
-		await chrome.storage.local.set({
-			[STATE_KEYS.PENDING]: null,
-			[STATE_KEYS.ACTIVE_INDEX]: (await getActiveIndex()) + 1,
-		});
-	} else {
-		const attempts = pending.attempt || 1;
-		if (attempts >= MAX_CAPTCHA_ATTEMPTS) {
-			await notify(
-				"CAPTCHA gagal",
-				`Terlalu banyak percobaan untuk ${
-					pending.displayCode || pending.valueCode
-				} ${pending.kelas}. Lewati.`
-			);
+		if (queueAtStart.length > 0) {
+			await chrome.storage.local.set({ [STATE_KEYS.PENDING]: null });
+		} else {
 			await chrome.storage.local.set({
 				[STATE_KEYS.PENDING]: null,
 				[STATE_KEYS.ACTIVE_INDEX]: (await getActiveIndex()) + 1,
 			});
+		}
+	} else {
+		const classes = parseAllClasses();
+		const found = classes.find((c) => c.rawValue === pending.rawValue);
+		let captchaError = true;
+		if (found) {
+			const { terisi, kuota } = found.kapasitas || {};
+			if (typeof terisi === "number" && typeof kuota === "number") {
+				if (kuota > 0 && terisi >= kuota) captchaError = false;
+			}
+		}
+		console.log("[FRS][Flow] evaluateAfterReload status", {
+			rawValue: pending.rawValue,
+			captchaError,
+		});
+
+		if (!captchaError) {
+			if (queueAtStart.length > 0) {
+				await chrome.storage.local.set({ [STATE_KEYS.PENDING]: null });
+			} else {
+				await chrome.storage.local.set({
+					[STATE_KEYS.PENDING]: null,
+					[STATE_KEYS.ACTIVE_INDEX]: (await getActiveIndex()) + 1,
+				});
+			}
 		} else {
-			await sleep(BACKOFF_MS);
-			await tryTakeCandidate(
-				found || pendingToCandidate(pending),
-				await getActiveIndex()
-			);
+			const attempts = pending.attempt || 1;
+			if (attempts >= MAX_CAPTCHA_ATTEMPTS) {
+				console.warn("[FRS][Flow] Max CAPTCHA attempts reached", {
+					rawValue: pending.rawValue,
+					attempts,
+				});
+				await notify(
+					"CAPTCHA gagal",
+					`Terlalu banyak percobaan untuk ${
+						pending.displayCode || pending.valueCode
+					} ${pending.kelas}. Lewati.`
+				);
+				if (queueAtStart.length > 0) {
+					await chrome.storage.local.set({ [STATE_KEYS.PENDING]: null });
+				} else {
+					await chrome.storage.local.set({
+						[STATE_KEYS.PENDING]: null,
+						[STATE_KEYS.ACTIVE_INDEX]: (await getActiveIndex()) + 1,
+					});
+				}
+			} else {
+				console.log("[FRS][Flow] Retrying candidate after CAPTCHA error", {
+					rawValue: pending.rawValue,
+					attempt: attempts + 1,
+					backoffMs: BACKOFF_MS,
+				});
+				await sleep(BACKOFF_MS);
+				await tryTakeCandidate(
+					found || pendingToCandidate(pending),
+					await getActiveIndex()
+				);
+			}
+		}
+	}
+
+	const st = await chrome.storage.local.get([STATE_KEYS.NOTIFY_QUEUE]);
+	const queue = Array.isArray(st[STATE_KEYS.NOTIFY_QUEUE])
+		? st[STATE_KEYS.NOTIFY_QUEUE]
+		: [];
+	if (queue.length && pending?.rawValue) {
+		if (queue[0] === pending.rawValue) {
+			queue.shift();
+			await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_QUEUE]: queue });
+			console.log("[FRS][Flow] Queue advanced", {
+				removed: pending.rawValue,
+				remaining: queue,
+			});
+		}
+		if (queue.length) {
+			console.log("[FRS][Flow] Proceeding to next queue item");
+			await huntNext(true);
+		} else {
+			await chrome.storage.local.set({ [STATE_KEYS.RUNMODE]: "idle" });
+			console.log("[FRS][Flow] Queue finished; RUNMODE -> idle");
 		}
 	}
 }
 
-/* ===========================
-	Notify Extended
-=========================== */
-
+/**
+ * Mengaktifkan atau menonaktifkan pemantau Notify Extended dan penjadwal reload.
+ * @param {boolean} enable True untuk mengaktifkan.
+ */
 async function enableNotifyWatcher(enable) {
-	// Baca opsi interval dari storage
+	console.log("[FRS][Flow] enableNotifyWatcher invoked", {
+		enable,
+		ts: Date.now(),
+	});
 	try {
 		const { opts } = await chrome.storage.local.get(["opts"]);
-		if (opts?.notifyIntervalSec)
+		if (opts?.notifyIntervalSec) {
 			notifyIntervalMs = Math.max(5, +opts.notifyIntervalSec) * 1000;
+			console.log(
+				"[FRS][Notify] notifyIntervalMs set from options:",
+				notifyIntervalMs
+			);
+		}
 	} catch {}
 
-	// Simpan flag enable/disable ke storage
 	await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_ENABLED]: !!enable });
+	console.log("[FRS][Flow] notifyEnabled flag stored", { enabled: !!enable });
 
-	// Bersihkan timer yang aktif jika ada
 	if (notifyTimer) {
 		clearTimeout(notifyTimer);
 		notifyTimer = null;
 	}
 
 	if (enable) {
-		await buildNotifyBaseline(); // Snapshot awal dari daftar prioritas
-		await notifyCheckAndSchedule(); // Cek sekarang, lalu jadwalkan reload
+		console.log(
+			"[FRS][Flow] Notify enable: building baseline then first check"
+		);
+		await buildNotifyBaseline();
+		console.log(
+			"[FRS][Flow] Baseline built. Running first notifyCheckAndSchedule()"
+		);
+		await notifyCheckAndSchedule();
 	} else {
 		removeOverlay();
+		console.log("[FRS][Flow] Notify disabled: overlay removed, timers cleared");
 	}
 }
 
-// Membangun baseline kuota dari kelas di daftar prioritas saat ini
+/**
+ * Menyusun baseline kuota saat ini untuk seluruh kelas prioritas sebagai acuan perbandingan.
+ */
 async function buildNotifyBaseline() {
+	console.log("[FRS][Notify] buildNotifyBaseline start");
 	const st = await chrome.storage.local.get([
 		STATE_KEYS.PRIORITY,
 		STATE_KEYS.CLASSES,
 	]);
 	const priority = st[STATE_KEYS.PRIORITY] || [];
-	const classes = st[STATE_KEYS.CLASSES]?.items || parseAllClasses();
+	let classes = st[STATE_KEYS.CLASSES]?.items;
+	if (!Array.isArray(classes) || !classes.length) {
+		console.log(
+			"[FRS][Notify] No cached classes when building baseline; reparsing DOM"
+		);
+		classes = parseAllClasses();
+	}
+	console.log("[FRS][Notify] baseline sources:", {
+		priority: priority.length,
+		classes: classes.length,
+	});
 
-	const pMap = new Map(priority.map((p) => [p.rawValue, true]));
+	const classMap = new Map(classes.map((c) => [c.rawValue, c]));
 	const baseline = {};
+	const notFound = [];
+	const noCapacity = [];
 
-	for (const c of classes) {
-		if (!pMap.has(c.rawValue)) continue;
+	for (const p of priority) {
+		const c = classMap.get(p.rawValue);
+		if (!c) {
+			notFound.push(p.rawValue);
+			continue;
+		}
 		const kuota = c.kapasitas?.kuota;
+		const terisi = c.kapasitas?.terisi;
 		if (typeof kuota === "number") {
-			baseline[c.rawValue] = { kuota, ts: Date.now() };
+			baseline[p.rawValue] = { kuota, terisi: terisi ?? null, ts: Date.now() };
+		} else {
+			baseline[p.rawValue] = { kuota: null, terisi: null, ts: Date.now() };
+			noCapacity.push(p.rawValue);
 		}
 	}
 
 	await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_BASELINE]: baseline });
+	console.log("[FRS][Notify] baseline saved", {
+		entries: Object.keys(baseline).length,
+		notFound,
+		noCapacity,
+		withCapacity: Object.values(baseline).filter((b) => b.kuota != null).length,
+	});
 }
 
-// Siklus Notify: bandingkan baseline vs kondisi sekarang.
-// Jika ada kenaikan kuota → overlay + suara + mulai hunting.
-// Jika tidak ada → perbarui baseline dan jadwalkan reload berikutnya.
+/**
+ * Melakukan satu siklus pemeriksaan kenaikan kuota, memicu antrean hunting bila ada peningkatan,
+ * memperbarui baseline, dan menjadwalkan reload halaman berikutnya.
+ */
 async function notifyCheckAndSchedule() {
+	const startedAt = Date.now();
+	console.log("[FRS][Flow] notifyCheckAndSchedule START", { ts: startedAt });
 	const st = await chrome.storage.local.get([
 		STATE_KEYS.NOTIFY_ENABLED,
 		STATE_KEYS.PRIORITY,
@@ -426,107 +617,182 @@ async function notifyCheckAndSchedule() {
 		STATE_KEYS.NOTIFY_BASELINE,
 		STATE_KEYS.RUNMODE,
 	]);
+	console.log("[FRS][Flow] notifyCheckAndSchedule state snapshot", {
+		enabled: !!st[STATE_KEYS.NOTIFY_ENABLED],
+		runMode: st[STATE_KEYS.RUNMODE],
+		baselineKeys: Object.keys(st[STATE_KEYS.NOTIFY_BASELINE] || {}).length,
+		classCountCached: st[STATE_KEYS.CLASSES]?.items?.length || 0,
+	});
 
-	// Jika notify tidak aktif atau sedang hunting, hentikan proses
-	if (!st[STATE_KEYS.NOTIFY_ENABLED] || st[STATE_KEYS.RUNMODE] !== "idle")
+	if (!st[STATE_KEYS.NOTIFY_ENABLED] || st[STATE_KEYS.RUNMODE] !== "idle") {
+		console.log(
+			"[FRS][Flow] notifyCheckAndSchedule ABORT (disabled or runMode != idle)"
+		);
 		return;
+	}
 
 	const priority = st[STATE_KEYS.PRIORITY] || [];
-	const pOrder = new Map(priority.map((p, i) => [p.rawValue, i])); // untuk pilih top-priority
+	const pOrder = new Map(priority.map((p, i) => [p.rawValue, i]));
 
-	// Pastikan data kelas terbaru tersedia
 	let classes = st[STATE_KEYS.CLASSES]?.items;
 	if (!Array.isArray(classes) || !classes.length) {
+		console.log("[FRS][Flow] No cached classes; reparsing DOM now");
 		classes = parseAllClasses();
 		await chrome.storage.local.set({
 			[STATE_KEYS.CLASSES]: { updatedAt: Date.now(), items: classes },
 		});
+		console.log("[FRS][Flow] Parsed classes", { count: classes.length });
 	}
 
 	const baseline = st[STATE_KEYS.NOTIFY_BASELINE] || {};
 	if (!Object.keys(baseline).length) {
+		console.log("[FRS][Flow] Baseline empty; rebuilding before comparison");
 		await buildNotifyBaseline();
 	}
 
-	// Bandingkan kuota baseline vs sekarang
 	const nowMap = new Map(classes.map((c) => [c.rawValue, c]));
 	const extendedItems = [];
 
+	let baselineChanged = false;
 	for (const [raw, base] of Object.entries(baseline)) {
 		const c = nowMap.get(raw);
 		if (!c) continue;
 		const newKuota = c.kapasitas?.kuota;
 		const oldKuota = base?.kuota;
-		if (typeof newKuota !== "number" || typeof oldKuota !== "number") continue;
-		if (newKuota > oldKuota) {
-			extendedItems.push({
-				rawValue: raw,
-				displayCode: c.displayCode || c.valueCode,
-				name: c.name || "",
-				kelas: c.kelas || "",
+		if (typeof oldKuota !== "number" && typeof newKuota === "number") {
+			baseline[raw] = {
+				kuota: newKuota,
+				terisi: c.kapasitas?.terisi ?? null,
+				ts: Date.now(),
+			};
+			baselineChanged = true;
+			console.log("[FRS][Flow] Baseline upgrade from placeholder", {
+				raw,
+				newKuota,
+			});
+			continue;
+		}
+		if (typeof newKuota === "number" && typeof oldKuota === "number") {
+			const delta = newKuota - oldKuota;
+			if (delta > 0) {
+				extendedItems.push({
+					rawValue: raw,
+					displayCode: c.displayCode || c.valueCode,
+					name: c.name || "",
+					kelas: c.kelas || "",
+					oldKuota,
+					newKuota,
+					delta,
+					kategori: c.kategori,
+				});
+			}
+			console.log("[FRS][Flow] Compare baseline vs now", {
+				raw,
 				oldKuota,
 				newKuota,
-				delta: newKuota - oldKuota,
-				kategori: c.kategori,
+				delta,
+			});
+		} else {
+			console.log("[FRS][Flow] Compare skip (non-numeric)", {
+				raw,
+				oldKuota,
+				newKuota,
 			});
 		}
 	}
-
+	if (baselineChanged) {
+		await chrome.storage.local.set({ [STATE_KEYS.NOTIFY_BASELINE]: baseline });
+		console.log("[FRS][Flow] Baseline persisted after upgrades");
+	}
+	console.log("[FRS][Flow] Extended scan result", {
+		found: extendedItems.length,
+	});
 	if (extendedItems.length) {
-		// Tampilkan overlay + mainkan suara peringatan
 		showOverlayExtended(extendedItems);
-		playLoudBeep();
+		try {
+			await chrome.runtime.sendMessage({
+				type: "START_DISTURBING_BEEP",
+				options: {
+					gain: 1,
+					stepMs: 120,
+					totalDurationMs: 10000,
+					freqHigh: 1700,
+					freqLow: 600,
+				},
+			});
+			console.log("[FRS][Flow] Beep started (10s) for extended detection");
+		} catch (e) {
+			playLoudBeep();
+			console.warn(
+				"[FRS][Flow] Offscreen beep failed, fallback playLoudBeep",
+				e
+			);
+		}
 
-		// Pilih target hunting berdasarkan urutan prioritas
 		extendedItems.sort(
 			(a, b) =>
 				(pOrder.get(a.rawValue) ?? 1e9) - (pOrder.get(b.rawValue) ?? 1e9)
 		);
-		const target = extendedItems[0];
-		const targetIndex = pOrder.get(target.rawValue) ?? 0;
+		const queueRaw = extendedItems
+			.map((it) => it.rawValue)
+			.filter((rv) => priority.some((p) => p.rawValue === rv));
+		console.log("[FRS][Flow] Extended queue (priority-filtered)", queueRaw);
 
-		// Matikan notify, set state hunting, dan mulai kandidat target
-		await chrome.runtime.sendMessage({ type: "NOTIFY_EXTENDED_FOUND" });
-		await chrome.storage.local.set({
-			[STATE_KEYS.NOTIFY_ENABLED]: false,
-			[STATE_KEYS.RUNMODE]: "hunting",
-			[STATE_KEYS.PENDING]: null,
-			[STATE_KEYS.ACTIVE_INDEX]: targetIndex,
-		});
-		await chrome.runtime.sendMessage({ type: "NOTIFY_SET_LAST_TS" });
-
-		// Mulai proses ambil kelas (langsung)
-		const st2 = await chrome.storage.local.get([STATE_KEYS.PRIORITY]);
-		const candidate = (st2[STATE_KEYS.PRIORITY] || [])[targetIndex];
-		if (candidate) {
-			await tryTakeCandidate(candidate, targetIndex);
+		if (queueRaw.length > 0) {
+			if (notifyTimer) {
+				clearTimeout(notifyTimer);
+				notifyTimer = null;
+				console.log("[FRS][Flow] Cleared existing reload timer");
+			}
+			await chrome.runtime.sendMessage({ type: "NOTIFY_EXTENDED_FOUND" });
+			console.log("[FRS][Flow] Switching to hunting mode for extended queue");
+			await chrome.storage.local.set({
+				[STATE_KEYS.NOTIFY_ENABLED]: false,
+				[STATE_KEYS.RUNMODE]: "hunting",
+				[STATE_KEYS.PENDING]: null,
+				[STATE_KEYS.NOTIFY_QUEUE]: queueRaw,
+			});
+			await chrome.runtime.sendMessage({ type: "NOTIFY_SET_LAST_TS" });
+			await huntNext(true);
+			return;
+		} else {
+			console.log(
+				"[FRS][Flow] None of extended belong to priority; remain in notify mode"
+			);
+			await chrome.runtime.sendMessage({ type: "NOTIFY_SET_LAST_TS" });
 		}
-		// Overlay akan hilang sendiri 10 detik atau saat submit
-		return;
 	}
 
-	// Tidak ada kenaikan kuota → perbarui baseline agar deteksi delta berkelanjutan
 	const newBaseline = {};
 	for (const p of priority) {
 		const c = nowMap.get(p.rawValue);
 		const kuota = c?.kapasitas?.kuota;
+		const terisi = c?.kapasitas?.terisi;
 		if (typeof kuota === "number")
-			newBaseline[p.rawValue] = { kuota, ts: Date.now() };
+			newBaseline[p.rawValue] = { kuota, terisi, ts: Date.now() };
 	}
 	await chrome.storage.local.set({
 		[STATE_KEYS.NOTIFY_BASELINE]: newBaseline,
 		[STATE_KEYS.NOTIFY_LAST_TS]: Date.now(),
 	});
 
-	// Jadwalkan reload berikutnya (menghormati interval dari Options)
 	if (notifyTimer) clearTimeout(notifyTimer);
+	console.log("[FRS][Flow] Scheduling page reload for notify cycle", {
+		inMs: notifyIntervalMs,
+	});
 	notifyTimer = setTimeout(() => {
-		// reload page untuk mendapatkan data terbaru
+		console.log("[FRS][Flow] Page reload NOW (notify cycle)");
 		location.reload();
 	}, notifyIntervalMs);
+	console.log("[FRS][Flow] notifyCheckAndSchedule END", {
+		durationMs: Date.now() - startedAt,
+	});
 }
 
-// Overlay merah berisi daftar kelas yang kuotanya bertambah (otomatis hilang 10 detik)
+/**
+ * Menampilkan overlay informasi kelas yang mengalami kenaikan kuota.
+ * @param {Array<Object>} items Daftar item yang naik kuotanya.
+ */
 function showOverlayExtended(items) {
 	removeOverlay();
 	const overlay = document.createElement("div");
@@ -590,7 +856,6 @@ function showOverlayExtended(items) {
 	overlay.appendChild(card);
 	document.body.appendChild(overlay);
 
-	// Auto-remove
 	setTimeout(removeOverlay, 10000);
 }
 
@@ -598,39 +863,82 @@ function removeOverlay() {
 	document.getElementById(OVERLAY_ID)?.remove();
 }
 
-// Suara peringatan singkat
+/**
+ * Memainkan bunyi peringatan sederhana sebagai fallback jika offscreen audio gagal.
+ */
 function playLoudBeep() {
 	try {
-		const audio = new Audio(
-			chrome.runtime.getURL("assets/notify-extended.mp3")
+		const ua = navigator.userActivation;
+		const canAutoPlay = !!(ua && (ua.isActive || ua.hasBeenActive));
+		console.log(
+			"[FRS] playLoudBeep: userActivation=",
+			ua,
+			"canAutoPlay=",
+			canAutoPlay
 		);
-		audio.play();
 
-		const AudioCtx = window.AudioContext || window.webkitAudioContext;
-		const ctx = new AudioCtx();
-		const osc = ctx.createOscillator();
-		const gain = ctx.createGain();
-		osc.type = "square";
-		osc.frequency.value = 880; // tinggi
-		gain.gain.value = 0.5; // cukup keras
-		osc.connect(gain).connect(ctx.destination);
-		osc.start();
+		if (canAutoPlay) {
+			try {
+				const url = chrome.runtime.getURL("assets/notify-extended.mp3");
+				const audio = new Audio(url);
+				audio.volume = 1;
+				console.log("[FRS] playLoudBeep: trying audio.play() =>", url);
+				const p = audio.play();
+				if (p && typeof p.then === "function")
+					p.then(() => {
+						console.log("[FRS] playLoudBeep: audio.play() resolved");
+					}).catch((e) => {
+						console.warn("[FRS] playLoudBeep: audio.play() rejected:", e);
+					});
+			} catch {}
 
-		// pattern: 300ms on, 150ms off, 300ms on
-		setTimeout(() => (gain.gain.value = 0), 300);
-		setTimeout(() => (gain.gain.value = 0.5), 450);
-		setTimeout(() => {
-			gain.gain.value = 0;
-			osc.stop();
-			ctx.close();
-		}, 750);
+			try {
+				const AudioCtx = window.AudioContext || window.webkitAudioContext;
+				console.log("[FRS] playLoudBeep: AudioContext available=", !!AudioCtx);
+				if (AudioCtx) {
+					const ctx = new AudioCtx();
+					console.log("[FRS] playLoudBeep: ctx.state=", ctx.state);
+					if (ctx.state === "suspended") {
+						console.log("[FRS] playLoudBeep: attempting ctx.resume()...");
+						ctx
+							.resume()
+							.then(() => {
+								console.log(
+									"[FRS] playLoudBeep: ctx resumed, state=",
+									ctx.state
+								);
+							})
+							.catch((e) => {
+								console.warn("[FRS] playLoudBeep: ctx.resume() failed:", e);
+							});
+					}
+					const osc = ctx.createOscillator();
+					const gain = ctx.createGain();
+					osc.type = "square";
+					osc.frequency.value = 880;
+					gain.gain.value = 0.5;
+					osc.connect(gain).connect(ctx.destination);
+					console.log("[FRS] playLoudBeep: oscillator start");
+					osc.start();
+					setTimeout(() => (gain.gain.value = 0), 300);
+					setTimeout(() => (gain.gain.value = 0.5), 450);
+					setTimeout(() => {
+						gain.gain.value = 0;
+						console.log("[FRS] playLoudBeep: oscillator stop & ctx.close()");
+						osc.stop();
+						ctx.close();
+					}, 750);
+				}
+			} catch {}
+		} else {
+			console.warn(
+				"[FRS] playLoudBeep: blocked due to no user activation; skipping audio"
+			);
+		}
 	} catch {}
 }
 
-/* ===========================
-	Utilitas bersama
-=========================== */
-
+/** Pastikan elemen form penting tersedia, jika tidak lempar error. */
 function ensureForm() {
 	if (!FORM.sip() || !FORM.act() || !FORM.key() || !FORM.captchaKey()) {
 		alert("Struktur form FRS berubah. Ekstensi tidak dapat melanjutkan.");
@@ -638,7 +946,12 @@ function ensureForm() {
 	}
 }
 
-// Membuat snapshot gambar captcha menjadi dataURL agar Popup tidak memicu request baru
+/**
+ * Menghasilkan dataURL captcha dari elemen/img URL dengan berbagai fallback.
+ * @param {HTMLImageElement|null} imgEl Elemen gambar captcha (opsional).
+ * @param {string} imgUrl URL absolut captcha.
+ * @returns {Promise<string>} dataURL PNG atau string kosong jika gagal.
+ */
 async function snapshotCaptcha(imgEl, imgUrl) {
 	try {
 		const src = imgEl ? imgEl.getAttribute("src") : imgUrl;
@@ -663,6 +976,9 @@ async function snapshotCaptcha(imgEl, imgUrl) {
 	}
 }
 
+/**
+ * Meminta captcha baru pada halaman, mengambil snapshot, dan mengumumkan ke background/popup.
+ */
 async function refreshCaptchaImage() {
 	const img = FORM.captchaImage();
 	if (!img) return;
@@ -696,6 +1012,11 @@ async function refreshCaptchaImage() {
 	});
 }
 
+/**
+ * Mengonversi elemen gambar HTML menjadi dataURL PNG.
+ * @param {HTMLImageElement} imgEl
+ * @returns {string}
+ */
 function captureElementToDataURL(imgEl) {
 	try {
 		const w = imgEl.naturalWidth || imgEl.width;
@@ -712,6 +1033,11 @@ function captureElementToDataURL(imgEl) {
 	}
 }
 
+/**
+ * Menggambar objek Image ke kanvas dan mengembalikan dataURL PNG.
+ * @param {HTMLImageElement} img
+ * @returns {string}
+ */
 function drawToDataURL(img) {
 	const w = img.naturalWidth || img.width;
 	const h = img.naturalHeight || img.height;
@@ -724,6 +1050,12 @@ function drawToDataURL(img) {
 	return canvas.toDataURL("image/png");
 }
 
+/**
+ * Memuat gambar dari sumber dan resolve boolean sukses.
+ * @param {HTMLImageElement} img
+ * @param {string} src
+ * @returns {Promise<boolean>}
+ */
 function imageLoad(img, src) {
 	return new Promise((resolve) => {
 		img.onload = () => resolve(true);
@@ -732,6 +1064,11 @@ function imageLoad(img, src) {
 	});
 }
 
+/**
+ * Mengonversi Blob menjadi dataURL.
+ * @param {Blob} blob
+ * @returns {Promise<string>}
+ */
 function blobToDataURL(blob) {
 	return new Promise((resolve, reject) => {
 		const fr = new FileReader();
@@ -741,6 +1078,10 @@ function blobToDataURL(blob) {
 	});
 }
 
+/**
+ * Mengurai semua kelas dari select di halaman menjadi array objek kelas terstruktur.
+ * @returns {Array<Object>}
+ */
 function parseAllClasses() {
 	const out = [];
 	for (const [kategori, sel] of Object.entries(SELECTORS)) {
@@ -806,6 +1147,11 @@ function parseAllClasses() {
 	return out;
 }
 
+/**
+ * Mengurai value option menjadi struktur kode, kelas, tahun kurikulum, dan jurusan.
+ * @param {string} val
+ * @returns {{code:string,kelas:string,thnKurikulum:string,jur:string}}
+ */
 function parseOptionValue(val) {
 	const parts = String(val).split("|");
 	return {
@@ -816,6 +1162,11 @@ function parseOptionValue(val) {
 	};
 }
 
+/**
+ * Mengambil teks representatif dari elemen option.
+ * @param {HTMLOptionElement} opt
+ * @returns {string}
+ */
 function getOptionText(opt) {
 	return (
 		opt.getAttribute?.("label") ||
@@ -826,6 +1177,7 @@ function getOptionText(opt) {
 	);
 }
 
+/** Menormalkan teks opsi untuk memudahkan parsing. */
 function prepareTextForParsing(s) {
 	let t = String(s).replace(/\u00A0/g, " ");
 	const pipeIdx = t.indexOf(" | ");
@@ -834,6 +1186,11 @@ function prepareTextForParsing(s) {
 	return t;
 }
 
+/**
+ * Menemukan pasangan terisi/kuota terakhir dalam teks.
+ * @param {string} text
+ * @returns {{terisi:number|null, kuota:number|null}}
+ */
 function parseCapacityFlexible(text) {
 	const matches = [...String(text).matchAll(/(\d+)\s*\/\s*(\d+)/g)];
 	if (!matches.length) return { terisi: null, kuota: null };
@@ -841,6 +1198,11 @@ function parseCapacityFlexible(text) {
 	return { terisi: parseInt(last[1], 10), kuota: parseInt(last[2], 10) };
 }
 
+/**
+ * Mengambil displayCode, nama mata kuliah, dan SKS dari teks dengan fallback.
+ * @param {string} text
+ * @returns {{displayCode:string,name:string,sks:number|null}}
+ */
 function parseDisplayMetaRobust(text) {
 	let m = String(text).match(/^\s*([A-Z]{1,4}\d{3,6})\s+(.+?)\((\d+)\)/);
 	if (m) {
@@ -870,6 +1232,12 @@ function parseDisplayMetaRobust(text) {
 	return { displayCode: codeGuess, name, sks };
 }
 
+/**
+ * Mengecek baris grid hasil FRS untuk memastikan kelas telah diambil.
+ * @param {string} codeOrDisplay Kode display atau kode nilai.
+ * @param {string|number} kelas Kelas target.
+ * @returns {boolean}
+ */
 function isCandidateInGrid(codeOrDisplay, kelas) {
 	const rows = document.querySelectorAll(".GridStyle tr");
 	for (const tr of rows) {
@@ -883,6 +1251,7 @@ function isCandidateInGrid(codeOrDisplay, kelas) {
 	return false;
 }
 
+/** Mengambil jumlah percobaan sebelumnya untuk kandidat yang sama. */
 async function getAttempt(rawValue) {
 	const { pendingAction } = await chrome.storage.local.get([
 		STATE_KEYS.PENDING,
@@ -890,11 +1259,13 @@ async function getAttempt(rawValue) {
 	if (pendingAction?.rawValue === rawValue) return pendingAction.attempt || 0;
 	return 0;
 }
+/** Mengambil indeks aktif saat ini dari penyimpanan. */
 async function getActiveIndex() {
 	const st = await chrome.storage.local.get([STATE_KEYS.ACTIVE_INDEX]);
 	return st[STATE_KEYS.ACTIVE_INDEX] || 0;
 }
 
+/** Mengubah struktur pendingAction menjadi kandidat kelas. */
 function pendingToCandidate(p) {
 	return {
 		rawValue: p.rawValue,
@@ -905,16 +1276,18 @@ function pendingToCandidate(p) {
 		kategori: p.kategori,
 	};
 }
+/** Promise sleep utilitas. */
 function sleep(ms) {
 	return new Promise((r) => setTimeout(r, ms));
 }
+/** Mengirim notifikasi OS melalui background. */
 async function notify(title, message) {
 	try {
 		await chrome.runtime.sendMessage({ type: "NOTIFY", title, message });
 	} catch {}
 }
 
-// Mencari elemen <select> berdasarkan label (teks di kolom pertama pada FilterBox)
+/** Mencari elemen select berdasarkan label teks pada FilterBox. */
 function findSelectByLabel(labelText) {
 	const rows = document.querySelectorAll("table.FilterBox tr");
 	for (const tr of rows) {
@@ -929,7 +1302,7 @@ function findSelectByLabel(labelText) {
 	return null;
 }
 
-// Utilitas kecil
+/** Meng-escape karakter HTML umum. */
 function escapeHtml(s) {
 	return String(s || "")
 		.replace(/&/g, "&amp;")

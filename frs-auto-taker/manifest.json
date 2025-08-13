@@ -16,7 +16,7 @@
 		"service_worker": "background.js"
 	},
 	"options_page": "options.html",
-	"permissions": ["storage", "tabs", "notifications"],
+	"permissions": ["storage", "tabs", "notifications", "offscreen"],
 	"host_permissions": ["*://*/list_frs.php*", "*://*/securimage/*"],
 	"content_scripts": [
 		{

@@ -1,6 +1,12 @@
-// Halaman Options: mengelola preferensi pengguna
-// - maxCaptcha: batas maksimal percobaan CAPTCHA saat hunting
-// - notifyIntervalSec: interval reload (detik) untuk Notify Extended
+/*
+ Dokumentasi
+ Nama Berkas: options.js
+ Deskripsi: Logika halaman opsi untuk menyimpan preferensi seperti batas percobaan CAPTCHA dan interval Notify Extended.
+ Tanggung Jawab:
+ - Membaca dan menulis preferensi ke chrome.storage.local.
+ - Memvalidasi nilai masukan sederhana.
+ Dependensi: DOM options.html, chrome.storage.local.
+*/
 const KEY = "opts";
 const els = {
 	maxCaptcha: document.getElementById("maxCaptcha"),
@@ -11,8 +17,8 @@ const els = {
 
 init().catch(console.error);
 
+/** Inisialisasi halaman opsi dan memuat nilai awal. */
 async function init() {
-	// Muat nilai awal dari storage dan pasang event handler
 	const st = await chrome.storage.local.get([KEY]);
 	const opts = st[KEY] || { maxCaptcha: 8, notifyIntervalSec: 30 };
 	els.maxCaptcha.value = opts.maxCaptcha ?? 8;
@@ -20,8 +26,8 @@ async function init() {
 	els.save.addEventListener("click", save);
 }
 
+/** Simpan preferensi ke chrome.storage.local. */
 async function save() {
-	// Validasi input dan simpan ke storage
 	const maxCaptcha = Math.max(
 		1,
 		Math.min(20, parseInt(els.maxCaptcha.value, 10) || 8)
