@@ -135,48 +135,23 @@ async function init() {
 		[STATE_KEYS.CLASSES]: { updatedAt: Date.now(), items: classes },
 	});
 
-	// Update priority quota info with latest from classes
-	let st = await chrome.storage.local.get([
-		STATE_KEYS.PRIORITY,
+	const { notifyExtendedEnabled } = await chrome.storage.local.get([
 		STATE_KEYS.NOTIFY_ENABLED,
-		STATE_KEYS.RUNMODE,
-		STATE_KEYS.PENDING,
 	]);
-	let priority = st[STATE_KEYS.PRIORITY] || [];
-	if (Array.isArray(priority) && priority.length) {
-		// Map rawValue to latest class info
-		const classMap = new Map(classes.map((c) => [c.rawValue, c]));
-		let updated = false;
-		for (let p of priority) {
-			const latest = classMap.get(p.rawValue);
-			if (latest) {
-				// Only update kapasitas if changed
-				if (
-					!p.kapasitas ||
-					p.kapasitas.terisi !== latest.kapasitas.terisi ||
-					p.kapasitas.kuota !== latest.kapasitas.kuota
-				) {
-					p.kapasitas = { ...latest.kapasitas };
-					updated = true;
-				}
-			}
-		}
-		if (updated) {
-			await chrome.storage.local.set({ [STATE_KEYS.PRIORITY]: priority });
-		}
-	}
-
-	if (st[STATE_KEYS.NOTIFY_ENABLED]) {
+	if (notifyExtendedEnabled) {
 		await notifyCheckAndSchedule();
 	}
 
-	if (
-		Array.isArray(priority) &&
-		priority.length &&
-		st[STATE_KEYS.RUNMODE] === "hunting"
-	) {
-		if (st[STATE_KEYS.PENDING]?.rawValue) {
-			await evaluateAfterReload(st[STATE_KEYS.PENDING]);
+	const { priority, runMode } = await chrome.storage.local.get([
+		STATE_KEYS.PRIORITY,
+		STATE_KEYS.RUNMODE,
+	]);
+	if (Array.isArray(priority) && priority.length && runMode === "hunting") {
+		const { pendingAction } = await chrome.storage.local.get([
+			STATE_KEYS.PENDING,
+		]);
+		if (pendingAction?.rawValue) {
+			await evaluateAfterReload(pendingAction);
 		}
 		await huntNext();
 	}
@@ -673,24 +648,15 @@ async function notifyCheckAndSchedule() {
 	if (!Object.keys(baseline).length) {
 		console.log("[FRS][Flow] Baseline empty; rebuilding before comparison");
 		await buildNotifyBaseline();
-		// Ambil baseline terbaru setelah build
-		const st2 = await chrome.storage.local.get([STATE_KEYS.NOTIFY_BASELINE]);
-		Object.assign(baseline, st2[STATE_KEYS.NOTIFY_BASELINE] || {});
 	}
 
 	const nowMap = new Map(classes.map((c) => [c.rawValue, c]));
 	const extendedItems = [];
+
 	let baselineChanged = false;
-	for (const p of priority) {
-		const raw = p.rawValue;
-		const base = baseline[raw];
+	for (const [raw, base] of Object.entries(baseline)) {
 		const c = nowMap.get(raw);
-		if (!c) {
-			console.log(
-				`[FRS][Notify] Priority ${raw} not found in latest class list.`
-			);
-			continue;
-		}
+		if (!c) continue;
 		const newKuota = c.kapasitas?.kuota;
 		const oldKuota = base?.kuota;
 		if (typeof oldKuota !== "number" && typeof newKuota === "number") {
@@ -719,18 +685,19 @@ async function notifyCheckAndSchedule() {
 					delta,
 					kategori: c.kategori,
 				});
-				console.log(
-					`[FRS][Notify] Kenaikan kuota terdeteksi untuk ${raw}: ${oldKuota} -> ${newKuota} (delta ${delta})`
-				);
-			} else {
-				console.log(
-					`[FRS][Notify] Tidak ada kenaikan kuota untuk ${raw}: ${oldKuota} -> ${newKuota}`
-				);
 			}
+			console.log("[FRS][Flow] Compare baseline vs now", {
+				raw,
+				oldKuota,
+				newKuota,
+				delta,
+			});
 		} else {
-			console.log(
-				`[FRS][Notify] Compare skip (non-numeric) ${raw}: old=${oldKuota}, new=${newKuota}`
-			);
+			console.log("[FRS][Flow] Compare skip (non-numeric)", {
+				raw,
+				oldKuota,
+				newKuota,
+			});
 		}
 	}
 	if (baselineChanged) {
@@ -739,7 +706,6 @@ async function notifyCheckAndSchedule() {
 	}
 	console.log("[FRS][Flow] Extended scan result", {
 		found: extendedItems.length,
-		items: extendedItems,
 	});
 	if (extendedItems.length) {
 		showOverlayExtended(extendedItems);
