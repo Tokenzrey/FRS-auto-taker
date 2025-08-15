@@ -344,23 +344,13 @@ async function tryTakeCandidate(candidate, index) {
 			imageDataUrl,
 			meta,
 		});
-		try {
-			await chrome.storage.local.set({
-				[STATE_KEYS.LAST_CAPTCHA]: {
-					imageUrl: imgUrl,
-					imageDataUrl,
-					tabId: null,
-					meta,
-					ts: Date.now(),
-				},
-			});
-		} catch {}
 	} catch (e) {
 		try {
 			await chrome.storage.local.set({
 				[STATE_KEYS.LAST_CAPTCHA]: {
 					imageUrl: imgUrl,
 					imageDataUrl,
+					// Fallback: we don't know tabId here, will be filled by background normally.
 					tabId: null,
 					meta,
 					ts: Date.now(),
