@@ -336,6 +336,7 @@ async function startHunt() {
 		alert("Priority kosong. Pilih kelas dulu.");
 		return;
 	}
+	const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 	await chrome.runtime.sendMessage({
 		type: "SET_STATE",
 		payload: {
@@ -343,10 +344,14 @@ async function startHunt() {
 			[STATE_KEYS.RUNMODE]: "hunting",
 			[STATE_KEYS.ACTIVE_INDEX]: 0,
 			[STATE_KEYS.PENDING]: null,
+			// Hint: store tabId as lastCaptcha holder if already available later
 		},
 	});
-	const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-	if (tab?.id) await chrome.tabs.sendMessage(tab.id, { type: "START_HUNT" });
+	if (tab?.id) {
+		try {
+			await chrome.tabs.sendMessage(tab.id, { type: "START_HUNT" });
+		} catch {}
+	}
 	enterHuntUI();
 }
 
@@ -363,7 +368,15 @@ async function submitCaptcha() {
 	const value = els.captchaInput.value.trim();
 	if (!value) return;
 	const lc = await chrome.storage.local.get([STATE_KEYS.LAST_CAPTCHA]);
-	const tabId = lc[STATE_KEYS.LAST_CAPTCHA]?.tabId;
+	let tabId = lc[STATE_KEYS.LAST_CAPTCHA]?.tabId;
+	if (!tabId) {
+		// Fallback: gunakan active tab saat ini
+		const [tab] = await chrome.tabs.query({
+			active: true,
+			currentWindow: true,
+		});
+		if (tab?.id) tabId = tab.id;
+	}
 	if (!tabId) {
 		alert("Tab FRS tidak ditemukan.");
 		return;
